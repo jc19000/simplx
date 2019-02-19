@@ -1243,7 +1243,6 @@ void Engine::StartSequence::addServiceActor(CoreId coreId, const _ActorInit &act
     unsigned serviceIndex = ServiceIndex::getIndexValue<_Service>();
     if (EngineStartSequenceServiceTraits<_Service>::isAnonymous() == false)
     {
-        serviceIndex = ServiceIndex::getIndexValue<_Service>();
         for (StarterChain::iterator i = starterChain.begin(), endi = starterChain.end(); i != endi; ++i)
         {
             if (i->isServiceFlag && i->serviceIndex == serviceIndex)
