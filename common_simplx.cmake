@@ -16,13 +16,14 @@ include_directories(${SIMPLX_DIR}/include)
 
 function(trz_set_cxx_flags)
     
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++11")
-    
     # search for user-defined c++ version
-    string(FIND ${CMAKE_CXX_FLAGS} "--std=c++" USER_CXX_VERSION_POS)
+    string(FIND "${CMAKE_CXX_FLAGS}" "--std=c++" USER_CXX_VERSION_POS)
     if (USER_CXX_VERSION_POS GREATER -1)
-        # user-defined C++ version
+        # user-defined C++ version — keep it
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    elseif (APPLE)
+        # Apple/Clang: modern libc++ (macOS 26 SDK) requires C++20 minimum
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++20")
     else()
         # default is c++11
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++11")
@@ -50,7 +51,7 @@ function(trz_set_cxx_flags)
         set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0")       			# -g already defined
         set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")					# adding flags here doesn't work
     elseif (${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
-        set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -std=c++11")
+        # C++ version already set above — no override needed
     else()
         message (FATAL_ERROR "unsupported C++ compiler ${CMAKE_CXX_COMPILER_ID}")
     endif()

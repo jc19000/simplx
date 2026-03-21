@@ -177,10 +177,16 @@ uint64_t getTSC()
     uint64_t a, d;
     __asm__ volatile("rdtsc" : "=a"(a), "=d"(d));
     return (d << 32) | a;
+#elif defined(__aarch64__)
+    // AArch64 (Apple Silicon / ARM64): read virtual counter register
+    uint64_t val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
 #else
-    uint32_t cc = 0;
-    __asm__ volatile ("mrc p15, 0, %0, c9, c13, 0":"=r" (cc));
-    return (uint64_t)cc; 
+    // Fallback: use monotonic clock
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
 }
 

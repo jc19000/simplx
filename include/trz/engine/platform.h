@@ -55,7 +55,7 @@
 #if !defined(TREDZONE_PLATFORM_LINUX) && defined(__linux__)
     #define TREDZONE_PLATFORM_LINUX
 #elif !defined(TREDZONE_PLATFORM_APPLE) && defined(__APPLE__)
-    #error Apple platform is currently under development!
+    #define TREDZONE_PLATFORM_APPLE
 #elif !defined(TREDZONE_PLATFORM_WINDOWS) && (defined(_WIN32) || defined(__CYGWIN__))
     #error Windows platform is currently under development!
 #endif
@@ -66,11 +66,18 @@
     #else
         #error No supported C++ compiler for LINUX
     #endif
-    
+
     #include "trz/engine/internal/linux/platform_linux.h"
-    
+
 #elif defined(TREDZONE_PLATFORM_APPLE)
-    #error Apple platform is currently under development!
+    #if defined(__clang__) || defined(__GNUG__)
+        #include "trz/engine/internal/linux/platform_gcc.h"
+    #else
+        #error No supported C++ compiler for APPLE
+    #endif
+
+    #include "trz/engine/internal/linux/platform_linux.h"
+
 #elif defined(TREDZONE_PLATFORM_WINDOWS)
     #error Windows platform is currently under development!
 #else

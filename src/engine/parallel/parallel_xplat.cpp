@@ -26,7 +26,14 @@ mutex_t mutexCreate(const MUTEX_T typ)
     {
         throw RunTimeException(__FILE__, __LINE__, systemErrorToString(cc));
     }
-    if ((cc = pthread_mutexattr_settype(&attr, (typ == MUTEX_T::RECURSIVE) ? PTHREAD_MUTEX_RECURSIVE_NP : PTHREAD_MUTEX_FAST_NP)) != 0)
+#if defined(__APPLE__)
+    #define TREDZONE_MUTEX_RECURSIVE PTHREAD_MUTEX_RECURSIVE
+    #define TREDZONE_MUTEX_FAST      PTHREAD_MUTEX_DEFAULT
+#else
+    #define TREDZONE_MUTEX_RECURSIVE PTHREAD_MUTEX_RECURSIVE_NP
+    #define TREDZONE_MUTEX_FAST      PTHREAD_MUTEX_FAST_NP
+#endif
+    if ((cc = pthread_mutexattr_settype(&attr, (typ == MUTEX_T::RECURSIVE) ? TREDZONE_MUTEX_RECURSIVE : TREDZONE_MUTEX_FAST)) != 0)
     {
         throw RunTimeException(__FILE__, __LINE__, systemErrorToString(cc));
     }

@@ -120,19 +120,19 @@ string systemErrorToString(int err)
     assert(err != 0);
     char buffer[4096];
 
-#if (_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE
+#if defined(__APPLE__) || ((_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && !_GNU_SOURCE)
     // POSIX strerror_r() returns int
     if (strerror_r(err, buffer, sizeof(buffer)))
     {
         return "<internal strerror_r() error>";
     }
-    
+
     const size_t sz = ::strlen(buffer);
     if (sz > 0 && buffer[sz - 1] == '\n')
     {
         buffer[sz - 1] = '\0';
     }
-    
+
     return buffer;
 
 #else
@@ -144,7 +144,7 @@ string systemErrorToString(int err)
 // put_time is missing in gcc 4.9
 // https://stackoverflow.com/questions/14136833/stdput-time-implementation-status-in-gcc#14137287
 
-#if __GNUC__ >= 5
+#if defined(__clang__) || __GNUC__ >= 5
 
 //---- Current ISO date/time UTC -----------------------------------------------
 
@@ -178,7 +178,7 @@ string currentISOTimeLocal(const string &fmt_s)
     return ss.str();
 }
 
-#endif // __GNUC__
+#endif // __clang__ || __GNUC__ >= 5
 
 } // namespace tredzone
 

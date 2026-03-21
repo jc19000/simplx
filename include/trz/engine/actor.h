@@ -750,7 +750,14 @@ public:
       private:
         friend class AsyncNode;
         friend class AsyncNodesHandle;
+        // On Apple/Clang, Actor::Allocator<T> cannot be used with std::vector inside
+        // the incomplete Actor class body (nested template + __is_allocator constraint).
+        // Fall back to the standard allocator on Apple.
+#if defined(__APPLE__)
+        typedef std::vector<const uint64_t *> SizePointerVector;
+#else
         typedef std::vector<const uint64_t *, Allocator<const uint64_t *>> SizePointerVector;
+#endif
         SizePointerVector writtenSizePointerVector;
         uint64_t loopTotalCount;
         uint64_t loopUsageCount;
@@ -758,9 +765,14 @@ public:
         uint64_t onCallbackCount;
 
         CorePerformanceCounters(const AllocatorBase &allocator, size_t nodeCount)
-            : writtenSizePointerVector(allocator), loopTotalCount(0), loopUsageCount(0), onEventCount(0),
+            :
+#if !defined(__APPLE__)
+              writtenSizePointerVector(allocator),
+#endif
+              loopTotalCount(0), loopUsageCount(0), onEventCount(0),
               onCallbackCount(0)
         {
+            (void)allocator;
             writtenSizePointerVector.reserve(nodeCount);
         }
         CorePerformanceCounters(const CorePerformanceCounters &);
@@ -1843,8 +1855,8 @@ public:
     bool isRegisteredHighPriorityEventHandler(EventId) const noexcept;
     bool isRegisteredEventHandler(EventId) const noexcept;
     bool isRegisteredUndeliveredEventHandler(EventId) const noexcept;
-    void registerCallback(void (*onCallback)(Callback &) /*noexcept*/, Callback &) noexcept;
-    void registerPerformanceNeutralCallback(void (*onCallback)(Callback &) /*noexcept*/, Callback &) noexcept;
+    void registerCallback(void (*onCallback)(Callback &) noexcept, Callback &) noexcept;
+    void registerPerformanceNeutralCallback(void (*onCallback)(Callback &) noexcept, Callback &) noexcept;
     Actor *getSingletonActor(SingletonActorIndex) noexcept;
     void reserveSingletonActor(SingletonActorIndex); // throw (CircularReferenceException)
     void setSingletonActor(SingletonActorIndex, Actor &) noexcept;

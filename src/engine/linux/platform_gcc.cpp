@@ -255,6 +255,10 @@ void tredzone::threadSetAffinity(unsigned cpuIndex)
 
 void tredzone::threadSetAffinity(const cpuset_type &pcpuset)
 {
+#if defined(__APPLE__)
+    // macOS does not support POSIX thread CPU affinity — no-op
+    (void)pcpuset;
+#else
     int cc;
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -273,10 +277,15 @@ void tredzone::threadSetAffinity(const cpuset_type &pcpuset)
     {
         throw RunTimeException(__FILE__, __LINE__, systemErrorToString(cc));
     }
+#endif
 }
 
 tredzone::cpuset_type tredzone::threadGetAffinity(void)
 {
+#if defined(__APPLE__)
+    // macOS does not support POSIX thread CPU affinity — return empty set
+    return cpuset_type();
+#else
     int cc;
     cpu_set_t cpuset;
     if ((cc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset)) != 0)
@@ -296,6 +305,7 @@ tredzone::cpuset_type tredzone::threadGetAffinity(void)
         }
     }
     return ret;
+#endif
 }
 
 void tredzone::threadSetRealTime(bool rt, const ThreadRealTimeParam &param)
@@ -335,11 +345,20 @@ void tredzone::threadSleep(const Time &delay)
 {
     const Time t = (delay != Time() ? delay : Time::Millisecond(1));
     struct timespec req = {t.extractSeconds(), (long)t.extractNanoseconds()};
+#if defined(__APPLE__)
+    // clock_nanosleep with CLOCK_MONOTONIC not available before macOS 10.15; use nanosleep
+    int cc;
+    if ((cc = nanosleep(&req, nullptr)) != 0 && errno != EINTR)
+    {
+        throw RunTimeException(__FILE__, __LINE__, systemErrorToString(errno));
+    }
+#else
     int cc;
     if ((cc = clock_nanosleep(CLOCK_MONOTONIC, 0, &req, 0)) != 0 && cc != EINTR)
     {
         throw RunTimeException(__FILE__, __LINE__, systemErrorToString(cc));
     }
+#endif
 }
 
 tredzone::tls_t tredzone::tlsCreate()
