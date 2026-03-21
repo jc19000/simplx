@@ -47,9 +47,20 @@ struct Actor::EventTable
         bool (*staticEventHandler)(void *, const Event &);
         inline RegisteredEvent() noexcept;
     };
+    // 5 void* fields: asyncActor, lfEvent, undeliveredEvent, nextUnused, deallocatePointer
+    // + fastDispatch (function ptr) + fastHandler (void*)
     static const int HIGH_FREQUENCY_CALLBACK_ARRAY_SIZE =
-        (3 * CACHE_LINE_SIZE - sizeof(NodeActorId) - 5 * sizeof(void *) - sizeof(size_t)) / sizeof(RegisteredEvent);
+        (3 * CACHE_LINE_SIZE - sizeof(NodeActorId) - 5 * sizeof(void *) - sizeof(size_t)
+         - sizeof(void *) - sizeof(bool (*)(void *, const Event &))) / sizeof(RegisteredEvent);
     static const int LOW_FREQUENCY_ARRAY_ALIGNEMENT = 5;
+
+    // Hot path: fastDispatch + fastHandler are checked first in onEvent().
+    // For StaticActor<>, fastDispatch is the compile-time resolved handler —
+    // same signature as RegisteredEvent::staticEventHandler, called with fastHandler.
+    // No extra indirection layer — same cost as the original single-event HF lookup.
+    bool (*fastDispatch)(void *, const Event &);
+    void *fastHandler;
+
     NodeActorId nodeActorId;
     RegisteredEvent hfEvent[HIGH_FREQUENCY_CALLBACK_ARRAY_SIZE];
     Actor *asyncActor;
@@ -1139,12 +1150,22 @@ private:
 // returns [dispatched ok]
 bool Actor::EventTable::onEvent(const Event &event, uint64_t &performanceCounter) const
 {
+    // Fast path: direct dispatch (set by StaticActor<>).
+    // Same cost as the original single-event HF hit but without the linear search.
+    // fastDispatch and fastHandler are at the top of the struct for cache locality.
+    if (__builtin_expect(fastDispatch != nullptr, 1))
+    {
+        ++performanceCounter;
+        return (*fastDispatch)(fastHandler, event);
+    }
+
+    // Standard path: linear search through HF event table
     int i = 0;
     for (EventId eventId = event.getClassId(); i < HIGH_FREQUENCY_CALLBACK_ARRAY_SIZE && hfEvent[i].eventId != eventId;
          ++i)
     {
     }
-    if (i == HIGH_FREQUENCY_CALLBACK_ARRAY_SIZE)
+    if (__builtin_expect(i == HIGH_FREQUENCY_CALLBACK_ARRAY_SIZE, 0))
     {
         return onLowFrequencyEvent(event, performanceCounter);
     }

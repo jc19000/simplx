@@ -21,7 +21,9 @@ volatile bool AsyncNodeAllocator::debugActivateMemoryLeakBacktraceFlag = false;
 
 AsyncNodeBase::StaticShared AsyncNodeBase::s_StaticShared;
 
-Actor::EventTable::EventTable(void *pdeallocatePointer) noexcept : nodeActorId(0),
+Actor::EventTable::EventTable(void *pdeallocatePointer) noexcept : fastDispatch(nullptr),
+                                                                        fastHandler(nullptr),
+                                                                        nodeActorId(0),
                                                                         asyncActor(0),
                                                                         lfEvent(0),
                                                                         undeliveredEvent(0),
