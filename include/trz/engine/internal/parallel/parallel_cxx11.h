@@ -23,6 +23,22 @@ void memoryBarrier()
     atomic_thread_fence(std::memory_order::memory_order_seq_cst);
 }
 
+inline void memoryBarrierAcquire()
+{
+    atomic_thread_fence(std::memory_order::memory_order_acquire);
+}
+
+inline void memoryBarrierRelease()
+{
+    atomic_thread_fence(std::memory_order::memory_order_release);
+}
+
+template <typename _Type>
+inline bool atomicCompareAndSwapAcqRel(_Type *ptr, _Type oldval, _Type newval)
+{
+    return __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
     
     
 } // namespace tredzone

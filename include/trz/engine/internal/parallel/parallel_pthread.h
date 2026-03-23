@@ -24,6 +24,24 @@ void memoryBarrier()
     __sync_synchronize();
 }
 
+// Relaxed barriers for use in hot paths where full seq_cst is overkill
+inline void memoryBarrierAcquire()
+{
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+inline void memoryBarrierRelease()
+{
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+// Relaxed CAS — acquire on success, relaxed on failure
+template <typename _Type>
+inline bool atomicCompareAndSwapAcqRel(_Type *ptr, _Type oldval, _Type newval)
+{
+    return __atomic_compare_exchange_n(ptr, &oldval, newval, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
 using thread_t = pthread_t;
 
 } // namespace tredzone

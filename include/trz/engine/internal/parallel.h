@@ -18,6 +18,12 @@
 namespace tredzone
 {
 
+// Number of spin iterations (with pause/yield hint) before falling back to sched_yield().
+// Tunable: higher = better latency under contention, more CPU burn.
+#ifndef TREDZONE_SPIN_COUNT_BEFORE_YIELD
+#define TREDZONE_SPIN_COUNT_BEFORE_YIELD 128
+#endif
+
 template <class _NodesHandle> class Parallel
 {
   public:
@@ -60,6 +66,7 @@ class Parallel<_NodesHandle>::Node
     inline void synchronizePostBarrier();
     inline Shared &getReferenceToWriterShared(NodeId);
     inline void setWriteSignal(NodeId, bool flag = true);
+    inline void flushWritesToPeers();
     inline size_t getNodeCount() const noexcept;
 
   protected:
@@ -77,10 +84,24 @@ class Parallel<_NodesHandle>::Node
         inline void operator()(ReaderSharedHandle &sharedHandle, NodeId)
         {
             assert(!sharedHandle.getIsReaderActive());
-            for (sharedHandle.setIsReaderActive(true); !atomicCompareAndSwap<sig_atomic_t>(
-                     &sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE, READER_CAS_ON);
-                 Thread::sleep())
+            sharedHandle.setIsReaderActive(true);
+            int spins = 0;
+            while (!atomicCompareAndSwapAcqRel<sig_atomic_t>(
+                     &sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE, READER_CAS_ON))
             {
+                if (++spins < TREDZONE_SPIN_COUNT_BEFORE_YIELD)
+                {
+#if defined(__aarch64__)
+                    __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+                    __asm__ volatile("pause" ::: "memory");
+#endif
+                }
+                else
+                {
+                    Thread::sleep();
+                    spins = 0;
+                }
             }
         }
     };
@@ -90,7 +111,7 @@ class Parallel<_NodesHandle>::Node
         {
             assert(sharedHandle.getIsReaderActive());
             assert(sharedHandle.getReferenceToReaderCAS() == READER_CAS_ON);
-            atomicCompareAndSwap<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_ON, READER_CAS_IDLE);
+            atomicCompareAndSwapAcqRel<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_ON, READER_CAS_IDLE);
             sharedHandle.setIsReaderActive(false);
         }
     };
@@ -106,14 +127,29 @@ class Parallel<_NodesHandle>::Node
     {
         inline void operator()(WriterSharedHandle &sharedHandle, NodeId)
         {
-            for (sharedHandle.setIsWriterActive(false); sharedHandle.getIsWriteLocked(); Thread::sleep())
+            sharedHandle.setIsWriterActive(false);
+            int spins = 0;
+            while (sharedHandle.getIsWriteLocked())
             {
-                if (atomicCompareAndSwap<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE,
+                if (atomicCompareAndSwapAcqRel<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE,
                                                        READER_CAS_OFF))
                 {
                     sharedHandle.setIsWriteLocked(false);
-                    atomicCompareAndSwap<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_OFF,
+                    atomicCompareAndSwapAcqRel<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_OFF,
                                                        READER_CAS_IDLE);
+                }
+                if (++spins < TREDZONE_SPIN_COUNT_BEFORE_YIELD)
+                {
+#if defined(__aarch64__)
+                    __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+                    __asm__ volatile("pause" ::: "memory");
+#endif
+                }
+                else
+                {
+                    Thread::sleep();
+                    spins = 0;
                 }
             }
         }
@@ -154,13 +190,13 @@ class Parallel<_NodesHandle>::Node
             {
                 if (sharedHandle.getIsWriteLocked())
                 {
-                    if (atomicCompareAndSwap<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE,
+                    if (atomicCompareAndSwapAcqRel<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_IDLE,
                                                            READER_CAS_OFF))
                     {
                         sharedHandle.writeFailed();
                         sharedHandle.setIsWriteLocked(false);
                         writeActivity[readerNodeId] = false;
-                        atomicCompareAndSwap<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_OFF,
+                        atomicCompareAndSwapAcqRel<sig_atomic_t>(&sharedHandle.getReferenceToReaderCAS(), READER_CAS_OFF,
                                                            READER_CAS_IDLE);
                     }
                 }
@@ -268,7 +304,7 @@ template <class _NodesHandle> Parallel<_NodesHandle>::Node::~Node()
     for (; writeSignal.any(); Thread::sleep())
     {
         SynchronizeWriteOperator writeOperator(*this);
-        memoryBarrier();
+        memoryBarrierRelease();
         for (int i = writeOperator.nodesCount; i > -1; --i)
         {
             assert(!nodeHandle.getWriterSharedHandle(writeOperator.nodes[i]).getIsWriteLocked());
@@ -297,8 +333,9 @@ template <class _NodesHandle> void Parallel<_NodesHandle>::Node::synchronizePreB
 
 template <class _NodesHandle> void Parallel<_NodesHandle>::Node::synchronizePostBarrier()
 {
-
-    memoryBarrier();
+    // Release barrier: ensure all reads from synchronizePreBarrier are visible
+    // before we unlock write locks. Full seq_cst is overkill here.
+    memoryBarrierRelease();
 
     for (int i = readOperator.nodesCount; i > -1; --i)
     {
@@ -331,6 +368,23 @@ template <class _NodesHandle> void Parallel<_NodesHandle>::Node::setWriteSignal(
 {
     assert(destNodeId < nodesHandleSize);
     writeSignal[destNodeId] = flag;
+}
+
+template <class _NodesHandle> void Parallel<_NodesHandle>::Node::flushWritesToPeers()
+{
+    // Only perform the write side of synchronization: move events from local
+    // WriteCache to shared ReadWriteLocked, making them visible to peer nodes.
+    // Safe to call from within an event handler (unlike full synchronize which is not reentrant).
+    SynchronizeWriteOperator flushOp(*this);
+
+    // Release barrier to make writes visible to readers
+    memoryBarrierRelease();
+
+    // Unlock the write locks we just acquired
+    for (int i = flushOp.nodesCount; i > -1; --i)
+    {
+        nodeHandle.getWriterSharedHandle(flushOp.nodes[i]).setIsWriteLocked(true);
+    }
 }
 
 template <class _NodesHandle>
