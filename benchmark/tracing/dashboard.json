@@ -1,0 +1,213 @@
+{
+  "uid": "simplx-traces",
+  "title": "Simplx - Distributed Tracing",
+  "tags": ["simplx", "tracing", "actors"],
+  "timezone": "browser",
+  "editable": true,
+  "templating": {
+    "list": [
+      {
+        "name": "session",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "PDEE91DDB90597936"
+        },
+        "definition": "SELECT DISTINCT session_id FROM simplx.traces ORDER BY session_id DESC LIMIT 20",
+        "query": "SELECT DISTINCT session_id FROM simplx.traces ORDER BY session_id DESC LIMIT 20",
+        "current": {
+          "selected": true,
+          "text": "test_run_1",
+          "value": "test_run_1"
+        },
+        "refresh": 2,
+        "sort": 2,
+        "includeAll": false,
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Actor Pipeline - Node Graph",
+      "description": "Event flow between actors with event count and avg latency per edge",
+      "type": "nodeGraph",
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 0 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "nodes",
+          "queryType": "sql",
+          "rawSql": "WITH actor_stats AS (\n  SELECT at.source_actor AS actor, count() AS cnt, avg(t.duration_ns) AS avg_dur\n  FROM simplx.traces AS t\n  INNER JOIN simplx.actor_types AS at ON t.event_class_id = at.event_class_id\n  WHERE t.session_id = '${session}' AND t.category = 'event'\n  GROUP BY at.source_actor\n  UNION ALL\n  SELECT at.dest_actor AS actor, count() AS cnt, avg(t.duration_ns) AS avg_dur\n  FROM simplx.traces AS t\n  INNER JOIN simplx.actor_types AS at ON t.event_class_id = at.event_class_id\n  WHERE t.session_id = '${session}' AND t.category = 'event'\n  GROUP BY at.dest_actor\n)\nSELECT\n  actor AS id,\n  actor AS title,\n  toString(round(sum(cnt))) AS mainstat,\n  concat(toString(round(avg(avg_dur) / 1000, 1)), ' us') AS secondarystat\nFROM actor_stats\nGROUP BY actor",
+          "format": 1
+        },
+        {
+          "refId": "edges",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  concat(at.source_actor, '->', at.dest_actor) AS id,\n  at.source_actor AS source,\n  at.dest_actor AS target,\n  toString(count()) AS mainstat,\n  concat(toString(round(avg(t.duration_ns) / 1000, 1)), ' us') AS secondarystat\nFROM simplx.traces AS t\nINNER JOIN simplx.actor_types AS at ON t.event_class_id = at.event_class_id\nWHERE t.session_id = '${session}' AND t.category = 'event'\nGROUP BY at.source_actor, at.dest_actor",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Event Types - Rate & Duration",
+      "description": "Per event type: count, avg/p50/p99 duration in microseconds",
+      "type": "table",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 14 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  concat(at.source_actor, ' -> ', at.dest_actor) AS flow,\n  at.event_name AS event,\n  count() AS count,\n  round(avg(t.duration_ns) / 1000, 1) AS avg_us,\n  round(quantile(0.5)(t.duration_ns) / 1000, 1) AS p50_us,\n  round(quantile(0.99)(t.duration_ns) / 1000, 1) AS p99_us,\n  round(max(t.duration_ns) / 1000, 1) AS max_us\nFROM simplx.traces AS t\nINNER JOIN simplx.actor_types AS at ON t.event_class_id = at.event_class_id\nWHERE t.session_id = '${session}' AND t.category = 'event'\nGROUP BY at.source_actor, at.dest_actor, at.event_name\nORDER BY count DESC",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [{ "id": "custom.displayMode", "value": "gradient-gauge" }]
+          }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "title": "Trace Waterfall - Causal Chain (sample)",
+      "description": "Shows causal chain: which event triggered which. parent_span_id links to the span that created each event.",
+      "type": "table",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 24 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  trace_id,\n  if(parent_span_id = 0, event_name, concat('  -> ', event_name)) AS event,\n  source_actor AS source,\n  dest_actor AS dest,\n  core,\n  offset_us,\n  duration_us,\n  span_id,\n  parent_span_id\nFROM (\n  SELECT\n    t.trace_id AS trace_id,\n    t.parent_span_id AS parent_span_id,\n    at.event_name AS event_name,\n    at.source_actor AS source_actor,\n    at.dest_actor AS dest_actor,\n    t.core_id AS core,\n    round(t.offset_ns / 1000, 1) AS offset_us,\n    round(t.duration_ns / 1000, 1) AS duration_us,\n    t.span_id AS span_id,\n    t.offset_ns AS offset_ns\n  FROM simplx.traces AS t\n  INNER JOIN simplx.actor_types AS at ON t.event_class_id = at.event_class_id\n  WHERE t.session_id = '${session}' AND t.category = 'event'\n    AND t.trace_id IN (\n      SELECT DISTINCT trace_id\n      FROM simplx.traces\n      WHERE session_id = '${session}' AND parent_span_id = 0 AND category = 'event'\n      LIMIT 5\n    )\n)\nORDER BY trace_id, offset_ns\nLIMIT 200",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Chain Depth Distribution",
+      "description": "Number of events per causal chain depth",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  concat('depth=', toString(depth)) AS depth,\n  count() AS traces\nFROM (\n  SELECT trace_id, count() AS depth\n  FROM simplx.traces\n  WHERE session_id = '${session}' AND category = 'event'\n  GROUP BY trace_id\n)\nGROUP BY depth\nORDER BY depth",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" } }
+      }
+    },
+    {
+      "id": 5,
+      "title": "End-to-End Latency (root to leaf)",
+      "description": "Total latency from first to last event in each trace chain (us)",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  (max(offset_ns + duration_ns) - min(offset_ns)) / 1000 AS e2e_us\nFROM simplx.traces\nWHERE session_id = '${session}' AND category = 'event'\nGROUP BY trace_id\nHAVING count() > 1\nLIMIT 10000",
+          "format": 1
+        }
+      ],
+      "options": {
+        "bucketSize": 10,
+        "combine": false,
+        "fillOpacity": 80
+      }
+    },
+    {
+      "id": 6,
+      "title": "Events per Core",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  concat('Core ', toString(core_id)) AS core,\n  toUInt64(count()) AS events\nFROM simplx.traces\nWHERE session_id = '${session}' AND category = 'event'\nGROUP BY core_id\nORDER BY core_id",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Span Categories",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  category,\n  toUInt64(count()) AS count\nFROM simplx.traces\nWHERE session_id = '${session}'\nGROUP BY category\nORDER BY count DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Session Stats",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "PDEE91DDB90597936"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT\n  count() AS total_spans,\n  uniq(trace_id) AS unique_traces,\n  round(avg(duration_ns) / 1000, 1) AS avg_event_us\nFROM simplx.traces\nWHERE session_id = '${session}'",
+          "format": 1
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 3,
+  "refresh": "",
+  "time": { "from": "now-1h", "to": "now" }
+}
