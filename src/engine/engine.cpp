@@ -11,6 +11,18 @@
 
 using namespace std;
 
+// Static storage for Tracer
+std::atomic<bool> tredzone::Tracer::s_enabled{false};
+tredzone::Tracer::ThreadBuffer tredzone::Tracer::s_buffers[tredzone::Tracer::MAX_THREADS];
+std::atomic<int> tredzone::Tracer::s_threadCount{0};
+uint64_t tredzone::Tracer::s_epochNs{0};
+
+// Thread-local storage for Tracer (defined here to avoid duplicate wrapper symbols in static lib)
+thread_local int tredzone::Tracer::s_threadId = -1;
+thread_local uint64_t tredzone::Tracer::s_currentTraceId = 0;
+thread_local uint64_t tredzone::Tracer::s_currentSpanId = 0;
+thread_local uint64_t tredzone::Tracer::s_spanCounter = 0;
+
 extern "C"
 {
     int TREDZONE_SDK_COMPATIBILITY_VERSION = tredzone::Engine::SDK_COMPATIBILITY_VERSION;
@@ -186,8 +198,15 @@ bool EngineEventLoop::isRunning() noexcept
     return true;
 }
 
+bool EngineEventLoop::lastSynchronizeWasIdle() const noexcept
+{
+    assert(asyncNode != 0);
+    return asyncNode->loopUsagePerformanceCounterIncrement == 0;
+}
+
 void EngineEventLoop::synchronize() noexcept
 {
+    TRZ_TRACE_SYNC();
 #ifndef NDEBUG
     ++debugSynchronizeCount;
 #endif

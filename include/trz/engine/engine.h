@@ -127,6 +127,11 @@ public:
     Actor::NodeId getNodeId() const noexcept;
     Actor::CoreId getCoreId() const noexcept;
     AsyncExceptionHandler &getAsyncExceptionHandler() const noexcept;
+    /**
+     * @brief Returns true if the last synchronize() cycle processed no events or callbacks.
+     * Useful for custom EventLoops that want to back off (sleep) when idle.
+     */
+    bool lastSynchronizeWasIdle() const noexcept;
     inline bool isInterrupted() const noexcept
     {
         assert(interruptFlag != 0);

@@ -193,7 +193,7 @@ void Thread::sleep(const Time &delay) { threadSleep(delay); }
 
 bool Thread::isRunning() const noexcept
 {
-    memoryBarrier();
+    memoryBarrierAcquire();
     return isRunningFlag;
 }
 

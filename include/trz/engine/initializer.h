@@ -135,7 +135,9 @@ class InitializerStartSequence<_InitData>::Callback : private MultiDoubleChainLi
 
   private:
     friend class InitializerStartSequence;
-    struct Chain : Callback::template DoubleChain<0u, Chain>
+    // GCC workaround: access DoubleChain via MultiDoubleChainLink directly,
+    // not through Callback (which privately inherits it — GCC nested class access bug)
+    struct Chain : MultiDoubleChainLink<Callback>::template DoubleChain<0u, Chain>
     {
         inline static Callback *getItem(MultiDoubleChainLink<Callback> *link) noexcept
         {

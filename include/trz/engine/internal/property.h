@@ -385,7 +385,9 @@ template <class _Allocator>
 class Property<_Allocator>::Collection : private MultiForwardChainLink<Collection>, public Property<_Allocator>
 {
   private:
-    struct Chain : Collection::template ForwardChain<0u, Chain>
+    // GCC workaround: access ForwardChain via MultiForwardChainLink directly,
+    // not through Collection (which privately inherits it — GCC nested class access bug)
+    struct Chain : MultiForwardChainLink<Collection>::template ForwardChain<0u, Chain>
     {
         inline static Collection *getItem(MultiForwardChainLink<Collection> *link) noexcept
         {
@@ -990,7 +992,7 @@ typename Property<_Allocator>::Collection::const_iterator Property<_Allocator>::
     return leaves.end();
 }
 
-template <class _Allocator> bool Property<_Allocator>::Collection::empty() const noexcept { return leaves.empty(); }
+template <class _Allocator> bool Property<_Allocator>::Collection::empty() const noexcept { return leaves.begin() == leaves.end(); }
 
 template <class _Allocator>
 template <class _NameStringType>
