@@ -19,6 +19,7 @@
 #include "trz/engine/internal/parallel.h"
 #include "trz/engine/internal/RefMapper.h"
 #include "trz/pattern/enterprise.h"
+#include "trz/engine/tracer.h"
 
 #define CRITICAL_ASSERT(x)                                                                                             \
     if (!(x))                                                                                                          \
@@ -168,12 +169,12 @@ class AsyncNodesHandle
             uint8_t batchIdIncrement;
             uint64_t batchId;
             uint64_t totalWrittenByteSize;
+            const size_t eventAllocatorPageSize;
+            size_t frontUsedEventAllocatorPageChainOffset;
             EventChain toBeDeliveredEventChain;
             EventChain toBeRoutedEventChain;
             EventChain toBeUndeliveredRoutedEventChain;
             UnreachableNodeConnectionChain unreachableNodeConnectionChain;
-            const size_t eventAllocatorPageSize;
-            size_t frontUsedEventAllocatorPageChainOffset;
             EventAllocatorPageChain usedEventAllocatorPageChain;
             EventAllocatorPageChain freeEventAllocatorPageChain;
             CacheLineAlignedBufferContainer eventAllocatorPageAllocator;
@@ -977,7 +978,10 @@ class AsyncNode : private AsyncNodeBase, public AsyncNodeManager::Node
                 if (callback.nodeActorId == callback.actorEventTable->nodeActorId)
                 {
                     ++performanceCounter;
-                    (*callback.onCallback)(callback);
+                    {
+                        TRZ_TRACE_CALLBACK();
+                        (*callback.onCallback)(callback);
+                    }
                     ENTERPRISE_0X500F((Actor*)(callback.actorEventTable->getActor()), &callback);
                 }
             }
@@ -1150,6 +1154,8 @@ private:
 // returns [dispatched ok]
 bool Actor::EventTable::onEvent(const Event &event, uint64_t &performanceCounter) const
 {
+    TRZ_TRACE_EVENT(event.getClassId(), event.getTraceId(), event.getTraceSpanId());
+
     // Fast path: direct dispatch (set by StaticActor<>).
     // Same cost as the original single-event HF hit but without the linear search.
     // fastDispatch and fastHandler are at the top of the struct for cache locality.

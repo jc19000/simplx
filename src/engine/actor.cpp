@@ -19,6 +19,19 @@ namespace tredzone
 const int Actor::MAX_NODE_COUNT;
 const int Actor::MAX_EVENT_ID_COUNT;
 
+// EventBase constructor — reads trace context from thread-local Tracer state.
+// Defined here (not inline in header) because actor.h cannot include tracer.h.
+// Cost: 2 TLS reads + 2 stores + 1 branch (predicted not-taken) when tracing disabled.
+Actor::EventBase::EventBase(Actor::EventId _classId, Actor::InProcessActorId _sourceActorId,
+                             Actor::InProcessActorId _destinationActorId, route_offset_type _routeOffset)
+    : classId(_classId), sourceActorId(_sourceActorId), destinationActorId(_destinationActorId), routeOffset(_routeOffset),
+      traceId(Tracer::currentTraceId()), traceSpanId(Tracer::currentSpanId())
+{
+    // If no trace context but tracing is enabled, this is a root event — generate a new traceId
+    if (__builtin_expect(traceId == 0 && Tracer::isEnabled(), false))
+        traceId = Tracer::nextTraceId();
+}
+
 Actor::EventId Actor::Event::retainEventId(EventToOStreamFunction peventNameToOStreamFunction,
                                                      EventToOStreamFunction peventContentToOStreamFunction,
                                                      EventIsE2ECapableFunction peventIsE2ECapableFunction)
@@ -375,6 +388,15 @@ void Actor::requestDestroy() noexcept
 }
 
 EngineEventLoop &Actor::getEventLoop() const noexcept { return *asyncNode->eventLoop; }
+
+void Actor::flushPipe() noexcept
+{
+    // Flush all pending writes from local WriteCache to shared ReadWriteLocked.
+    // This makes pushed events immediately visible to peer nodes without waiting
+    // for the current synchronize cycle to complete.
+    // Safe to call from within an event handler (unlike full synchronize).
+    asyncNode->flushWritesToPeers();
+}
 
 const Actor::CorePerformanceCounters &Actor::getCorePerformanceCounters() const noexcept
 {

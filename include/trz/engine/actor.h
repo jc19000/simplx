@@ -1730,6 +1730,19 @@ public:
      */
     EngineEventLoop &getEventLoop() const noexcept;
 
+    /**
+     * @brief Flush all pending events to shared memory immediately.
+     *
+     * Moves events from the local WriteCache to shared ReadWriteLocked state,
+     * making them visible to peer nodes without waiting for the current
+     * synchronize cycle to complete. This enables pipeline parallelism:
+     * after flushing, downstream actors can process events while this actor
+     * continues its work (e.g. computation or I/O).
+     *
+     * Safe to call from within an event handler.
+     */
+    void flushPipe() noexcept;
+
   private:
     friend class AsyncNode;
     friend struct AsyncNodeBase;
@@ -1951,9 +1964,10 @@ struct Actor::UndersizedException : std::bad_alloc
 struct Actor::EventBase
 {
 public:
-  
+
     EventBase()
-        : classId(0), sourceActorId(0), destinationActorId(0), routeOffset(0)
+        : classId(0), sourceActorId(0), destinationActorId(0), routeOffset(0),
+          traceId(0), traceSpanId(0)
     {
         // should never instantiate EventBase or a derivative manually
         // Events are instatiated "in-place" by the engine inside pipe::push<>()
@@ -1961,7 +1975,7 @@ public:
     }
 
 private:
-  
+
     friend class Actor::Event;
     friend class AsyncExceptionHandler;
     friend class EngineToEngineConnectorEventFactory;
@@ -1972,10 +1986,13 @@ private:
     Actor::InProcessActorId destinationActorId;
     route_offset_type       routeOffset;
 
-    EventBase(Actor::EventId _classId, Actor::InProcessActorId _sourceActorId, Actor::InProcessActorId _destinationActorId, route_offset_type _routeOffset)
-        : classId(_classId), sourceActorId(_sourceActorId), destinationActorId(_destinationActorId), routeOffset(_routeOffset)
-    {
-    }
+    // Distributed trace context — propagated automatically through event chains.
+    // Set by EventBase constructor from thread-local Tracer context.
+    // Cost when tracing disabled: 2 TLS reads (returning 0) + 2 stores (~2ns).
+    uint64_t                traceId;      // trace chain ID (0 = no trace)
+    uint64_t                traceSpanId;  // span that created this event (parent)
+
+    EventBase(Actor::EventId _classId, Actor::InProcessActorId _sourceActorId, Actor::InProcessActorId _destinationActorId, route_offset_type _routeOffset);
 };
 
 namespace e2econnector
@@ -2085,6 +2102,10 @@ public:
      * @return The engine (process) unique run-time id for this Event sub-class.
      */
     inline EventId getClassId() const noexcept { return classId; }
+    /** @brief Getter. @return The trace chain ID (0 if no trace context). */
+    inline uint64_t getTraceId() const noexcept { return traceId; }
+    /** @brief Getter. @return The span ID of the event that created this one. */
+    inline uint64_t getTraceSpanId() const noexcept { return traceSpanId; }
     /**
      * @brief Getter.
      * @return The place holder to output this event's name.
