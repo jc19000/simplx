@@ -96,7 +96,13 @@ fn run_engine(iterations: u64, warmup: u64, ping_core: usize, pong_core: usize) 
     });
     let engine = Engine::start(sequence);
     let results = rx.recv().expect("ping actor did not report");
-    engine.shutdown(); // after the run, as in the C++ bench
+    // After the run, as in the C++ bench.
+    for c in engine.shutdown() {
+        eprintln!(
+            "counters core={} loop_total={} loop_usage={} events={} callbacks={} publications={} bytes_written_to={:?}",
+            c.core, c.loop_total, c.loop_usage, c.events, c.callbacks, c.publications, c.bytes_written_to
+        );
+    }
     results
 }
 

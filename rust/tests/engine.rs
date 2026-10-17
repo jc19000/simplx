@@ -355,3 +355,138 @@ fn events_in_flight_at_shutdown_are_dropped() {
     Engine::start(seq).shutdown(); // immediately, while the flood is still being delivered
     assert_eq!(Arc::strong_count(&token), 1, "some events were leaked");
 }
+
+// ---- Manual flush and counters ---------------------------------------------------------------
+
+struct Mark(Instant);
+
+struct Stamp {
+    log: Log,
+}
+
+impl Actor for Stamp {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<Mark, Self>();
+    }
+}
+
+impl Handler<Mark> for Stamp {
+    fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, e: &Mark) {
+        log(&self.log, format!("{}", e.0.elapsed().as_millis()));
+    }
+}
+
+/// Sends a Mark, optionally flushes, then keeps its core busy for 40 ms. Done from a callback:
+/// `on_start` runs before the other cores enter their event loop.
+struct SlowSender {
+    dst: ActorId,
+    flush: bool,
+}
+
+impl Actor for SlowSender {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_callback();
+    }
+
+    fn on_callback(&mut self, ctx: &mut Context) {
+        ctx.send(self.dst, Mark(Instant::now()));
+        if self.flush {
+            ctx.flush();
+        }
+        let until = Instant::now() + Duration::from_millis(40);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn mark_delay_ms(flush: bool) -> u128 {
+    let log = Log::default();
+    let mut seq = StartSequence::new();
+    let l = log.clone();
+    let dst = seq.add_actor(2, move || Stamp { log: l });
+    seq.add_actor(1, move || SlowSender { dst, flush });
+    let engine = Engine::start(seq);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lines(&log).is_empty() {
+        assert!(Instant::now() < deadline);
+    }
+    engine.shutdown();
+    lines(&log)[0].parse().unwrap()
+}
+
+#[test]
+fn manual_flush_publishes_before_the_end_of_the_iteration() {
+    let _g = serial();
+    let without = mark_delay_ms(false);
+    let with = mark_delay_ms(true);
+    assert!(without >= 40, "without flush the event waits for the end of the handler: {without} ms");
+    assert!(with < 20, "with flush the event is delivered while the sender is busy: {with} ms");
+}
+
+struct Echo;
+
+impl Actor for Echo {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<Small, Self>();
+    }
+}
+
+impl Handler<Small> for Echo {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, e: &Small) {
+        ctx.send(src, Small(e.0));
+    }
+}
+
+struct Pinger {
+    echo: ActorId,
+    left: u32,
+    done: Arc<AtomicUsize>,
+}
+
+impl Actor for Pinger {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<Small, Self>();
+        ctx.send(self.echo, Small(0));
+    }
+}
+
+impl Handler<Small> for Pinger {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, _e: &Small) {
+        self.left -= 1;
+        if self.left == 0 {
+            self.done.store(1, Ordering::Release);
+        } else {
+            ctx.send(src, Small(0));
+        }
+    }
+}
+
+#[test]
+fn counters_account_for_events_bytes_and_publications() {
+    let _g = serial();
+    const N: u64 = 1000;
+    let done = Arc::new(AtomicUsize::new(0));
+    let mut seq = StartSequence::new();
+    let echo = seq.add_actor(2, || Echo);
+    let d = done.clone();
+    seq.add_actor(1, move || Pinger { echo, left: N as u32, done: d });
+    let engine = Engine::start(seq);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline);
+    }
+    let counters = engine.shutdown();
+    assert_eq!(counters.iter().map(|c| c.core).collect::<Vec<_>>(), vec![1, 2]);
+    let record = 64; // 48-byte header + 1-byte event, rounded to 16
+    for c in &counters {
+        assert_eq!(c.events, N, "core {}", c.core);
+        assert_eq!(c.callbacks, 0);
+        assert!(c.loop_usage >= N && c.loop_usage <= c.loop_total, "{c:?}");
+        let other = if c.core == 1 { 2 } else { 1 };
+        assert_eq!(c.bytes_written_to[other], N * record, "{c:?}");
+        assert_eq!(c.bytes_written_to[c.core], 0);
+        // One event in flight at a time: one publication per event sent.
+        assert!(c.publications >= N - 1 && c.publications <= N, "{c:?}");
+    }
+}

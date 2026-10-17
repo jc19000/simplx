@@ -19,9 +19,10 @@
 //! | `registerCallback(*this)` / `onCallback()` | `ctx.register_callback()` / `on_callback()` |
 //! | `addServiceActor<Tag, A>(core)` / `getServiceActorId<Tag>()` | `add_service::<Tag, _>(core, f)` / `ctx.service::<Tag>()` |
 //! | `Engine` destructor                      | `Engine::shutdown()` / `Drop`                |
+//! | `getCorePerformanceCounters()`           | `ctx.counters()` / `Engine::counters()`      |
 //!
 //! Events sent during a loop iteration are staged and published once per destination core at the
-//! end of the iteration. Handlers receive a reference into the ring itself: no copy on delivery.
+//! end of the iteration, or earlier with `ctx.flush()`. Handlers receive a reference into the ring itself: no copy on delivery.
 //! On shutdown, regular actors are asked to destroy themselves first, services once no regular
 //! actor is left anywhere; the loops exit when no actor is left.
 //!
@@ -39,7 +40,7 @@ use std::rc::Rc;
 use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::affinity;
@@ -388,6 +389,33 @@ struct HandlerRegistration {
     thunk: Thunk,
 }
 
+/// Per-core performance counters (simplx `CorePerformanceCounters`). All cumulative.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreCounters {
+    pub core: CoreId,
+    /// Event-loop iterations.
+    pub loop_total: u64,
+    /// Iterations that ran at least one actor callback (event, callback, destroy request):
+    /// `loop_usage / loop_total` is the core's saturation.
+    pub loop_usage: u64,
+    /// Event handler calls, undelivered handlers included.
+    pub events: u64,
+    /// `on_callback` calls.
+    pub callbacks: u64,
+    /// Ring publications (one Release store of `tail` each): events sent / publications is the
+    /// batching factor.
+    pub publications: u64,
+    /// Bytes of event records written towards each core (headers included), by core id; the
+    /// entry of this core counts local events.
+    pub bytes_written_to: Vec<u64>,
+}
+
+#[repr(align(128))]
+struct Padded<T>(T);
+
+/// Iterations between two publications of the counters for `Engine::counters`.
+const COUNTERS_PUBLISH_PERIOD: u64 = 4096;
+
 struct Shared {
     shutdown: AtomicBool,
     live_total: AtomicUsize,
@@ -395,6 +423,7 @@ struct Shared {
     services: HashMap<TypeId, ActorId>,
     cores: usize,
     cores_done: AtomicUsize,
+    counters: Vec<Padded<Mutex<CoreCounters>>>, // by core id, published periodically by each loop
 }
 
 #[repr(align(128))]
@@ -424,6 +453,9 @@ pub struct Context {
     cells: Vec<Option<(u16, Rc<dyn Any>)>>, // by slot index, to hand out references
     refs: Rc<Refs>,
     singletons: HashMap<TypeId, ActorId>,
+
+    counters: CoreCounters,
+    active: bool, // an actor callback ran in this iteration
 }
 
 impl Context {
@@ -568,12 +600,21 @@ impl Context {
         self.shared.0.services.get(&TypeId::of::<Tag>()).copied()
     }
 
+    /// This core's counters, up to date.
+    pub fn counters(&self) -> &CoreCounters {
+        &self.counters
+    }
+
     #[inline]
     fn alloc_record(&mut self, core: u16, len: usize) -> *mut u8 {
         if core == self.core {
+            self.counters.bytes_written_to[self.core as usize] += len as u64;
             return self.local.alloc(len);
         }
         let c = core as CoreId;
+        if let Some(bytes) = self.counters.bytes_written_to.get_mut(c) {
+            *bytes += len as u64;
+        }
         match self.outbound.get_mut(c).and_then(Option::as_mut) {
             Some(producer) => {
                 assert!(len <= producer.max_record(), "event too large for the ring");
@@ -609,9 +650,13 @@ impl Context {
         (*(copy as *mut Header)).kind = KIND_UNDELIVERED;
     }
 
-    /// Publishes staged records; overflow is retried on the next iteration.
+    /// Publishes the events sent so far to other cores now, instead of at the end of the loop
+    /// iteration: one Release store per destination core with pending events. Useful before a
+    /// long computation in a handler. Events that did not fit in a full ring stay queued and are
+    /// retried at the end of the iteration. Local events are unaffected (dispatched in this
+    /// iteration anyway).
     #[inline]
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         let mut i = 0;
         while i < self.dirty.len() {
             let c = self.dirty[i];
@@ -631,6 +676,7 @@ impl Context {
                 overflow.consume_front(offset);
             }
             producer.commit();
+            self.counters.publications += 1;
             if overflow.is_empty() {
                 self.dirty.swap_remove(i);
             } else {
@@ -740,6 +786,7 @@ impl Engine {
             services,
             cores: cores.len(),
             cores_done: AtomicUsize::new(0),
+            counters: (0..n).map(|_| Padded(Mutex::new(CoreCounters::default()))).collect(),
         }));
 
         let mut per_core_entries: Vec<Vec<StartEntry>> = (0..n).map(|_| Vec::new()).collect();
@@ -772,10 +819,17 @@ impl Engine {
         Engine { shared, threads }
     }
 
-    /// Requests destruction of every actor (regular actors first, then services) and waits until
-    /// all of them accepted and every event loop exited.
-    pub fn shutdown(mut self) {
+    /// Latest counters of each core, as published by the loops every few thousand iterations
+    /// (exact once the engine is shut down).
+    pub fn counters(&self) -> Vec<CoreCounters> {
+        published_counters(&self.shared.0)
+    }
+
+    /// Requests destruction of every actor (regular actors first, then services), waits until
+    /// all of them accepted and every event loop exited, and returns the final counters.
+    pub fn shutdown(mut self) -> Vec<CoreCounters> {
         self.stop();
+        published_counters(&self.shared.0)
     }
 
     fn stop(&mut self) {
@@ -784,6 +838,10 @@ impl Engine {
             handle.join().expect("engine thread panicked");
         }
     }
+}
+
+fn published_counters(shared: &Shared) -> Vec<CoreCounters> {
+    shared.counters.iter().map(|c| c.0.lock().unwrap().clone()).filter(|c| c.loop_total > 0).collect()
 }
 
 impl Drop for Engine {
@@ -910,6 +968,8 @@ impl Actors {
             let target = self.live(ctx.core, header.dst).map(|s| (s.actor_ptr, find(&s.handlers, header.type_id)));
             if let Some((actor, Some(thunk))) = target {
                 ctx.current = header.dst;
+                ctx.counters.events += 1;
+                ctx.active = true;
                 thunk(actor, ctx, header.src, payload);
                 let returned = std::mem::take(&mut ctx.return_to_sender);
                 self.apply_effects(ctx);
@@ -923,6 +983,8 @@ impl Actors {
             let target = self.live(ctx.core, header.src).map(|s| (s.actor_ptr, find(&s.undelivered, header.type_id)));
             if let Some((actor, Some(thunk))) = target {
                 ctx.current = header.src;
+                ctx.counters.events += 1;
+                ctx.active = true;
                 thunk(actor, ctx, header.dst, payload);
                 self.apply_effects(ctx);
             }
@@ -941,6 +1003,8 @@ impl Actors {
             slot.callback_iteration = iteration;
             let cell = slot.cell.clone().unwrap();
             ctx.current = *id;
+            ctx.counters.callbacks += 1;
+            ctx.active = true;
             cell.on_callback(ctx);
             self.apply_effects(ctx);
         }
@@ -992,6 +1056,7 @@ impl Actors {
             }
             ctx.current = id;
             let cell = self.slots[index].cell.clone().unwrap();
+            ctx.active = true;
             let accepted = cell.on_destroy_request(ctx);
             self.apply_effects(ctx);
             if accepted {
@@ -1040,6 +1105,8 @@ impl CoreLoop {
             cells: Vec::new(),
             refs: Rc::new(Refs::default()),
             singletons: HashMap::new(),
+            counters: CoreCounters { core, bytes_written_to: vec![0; n], ..CoreCounters::default() },
+            active: false,
         };
         let mut actors = Actors { slots: Vec::new() };
 
@@ -1085,10 +1152,20 @@ impl CoreLoop {
             actors.run_destroy_requests(&mut ctx, &shared.0);
             ctx.flush();
             iteration += 1;
+            ctx.counters.loop_total += 1;
+            ctx.counters.loop_usage += ctx.active as u64;
+            ctx.active = false;
+            if ctx.counters.loop_total % COUNTERS_PUBLISH_PERIOD == 0 {
+                // try_lock: never wait for a reader on the hot path, publish next time instead.
+                if let Ok(mut published) = shared.0.counters[core].0.try_lock() {
+                    published.clone_from(&ctx.counters);
+                }
+            }
             if shared.0.live_total.load(Ordering::Acquire) == 0 && ctx.local.is_empty() {
                 break;
             }
         }
+        shared.0.counters[core].0.lock().unwrap().clone_from(&ctx.counters);
 
         // No actor left anywhere, so nothing can handle an event anymore: drop whatever arrives,
         // push out our remaining overflow, and keep draining until every core did the same.
