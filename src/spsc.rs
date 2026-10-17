@@ -6,6 +6,9 @@
 //!   looks full (producer) or empty (consumer), which keeps cache-line traffic to a minimum.
 //! - Writes and reads can be batched: `write` stages an item and `commit` publishes all staged
 //!   items with a single Release store (same on the consumer side with `read` / `release`).
+//! - `Producer` and `Consumer` are themselves cache-line aligned: their local indexes are written
+//!   on every operation and must not share a line with the other side's state, wherever the
+//!   containers holding them were allocated.
 //! - Splitting the ring into a non-clonable `Producer` and `Consumer` makes the single-writer /
 //!   single-reader contract a compile-time guarantee.
 
@@ -56,6 +59,7 @@ pub fn channel<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     )
 }
 
+#[repr(align(128))]
 pub struct Producer<T> {
     ring: Arc<Ring<T>>,
     tail: usize,
@@ -98,6 +102,7 @@ impl<T> Drop for Producer<T> {
     }
 }
 
+#[repr(align(128))]
 pub struct Consumer<T> {
     ring: Arc<Ring<T>>,
     head: usize,
