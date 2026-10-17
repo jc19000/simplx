@@ -80,3 +80,6 @@ endif()
 #Tutorial
 add_subdirectory(tutorials)
 
+
+#Benchmarks
+add_subdirectory(bench/pingpong_cpp)

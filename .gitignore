@@ -30,3 +30,5 @@ e2e_localhost.txt
 /.vscode
 .vscode/*
 
+build/
+rust/target/

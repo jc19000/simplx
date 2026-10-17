@@ -1,0 +1,15 @@
+[package]
+name = "simplx-rs"
+version = "0.1.0"
+edition = "2021"
+description = "PoC: simplx-like per-core actor engine in Rust, for latency comparison with simplx"
+license = "Apache-2.0"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
