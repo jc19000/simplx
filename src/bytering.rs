@@ -9,6 +9,7 @@ use std::alloc::{self, Layout};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Alignment, and length granularity, of every record.
 pub const RECORD_ALIGN: usize = 16;
 const PAD: u32 = 1 << 31;
 
@@ -52,6 +53,7 @@ pub fn channel(capacity: usize) -> (Producer, Consumer) {
     (Producer { ring: ring.clone(), tail: 0, head_cache: 0 }, Consumer { ring, head: 0, tail_cache: 0 })
 }
 
+/// Writing end of a byte ring (one thread).
 #[repr(align(128))]
 pub struct Producer {
     ring: Arc<Ring>,
@@ -93,6 +95,7 @@ impl Producer {
         }
     }
 
+    /// Publishes every record reserved so far with a single Release store.
     #[inline]
     pub fn commit(&mut self) {
         self.ring.tail.0.store(self.tail, Ordering::Release);
@@ -105,6 +108,7 @@ impl Drop for Producer {
     }
 }
 
+/// Reading end of a byte ring (one thread).
 #[repr(align(128))]
 pub struct Consumer {
     ring: Arc<Ring>,
@@ -134,6 +138,7 @@ impl Consumer {
         }
     }
 
+    /// Moves past the record of `len` bytes returned by `peek`.
     #[inline]
     pub fn advance(&mut self, len: usize) {
         self.head += len;

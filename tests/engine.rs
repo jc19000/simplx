@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use simplx_rs::{Actor, ActorId, Context, Engine, Handler, StartSequence, UndeliveredHandler};
+use cannes::{Actor, ActorId, Context, Engine, Handler, StartSequence, UndeliveredHandler};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -103,7 +103,14 @@ fn heterogeneous_events_local_and_remote() {
     got.sort();
     assert_eq!(
         got,
-        vec!["big 64", "big 64", "small 7 from core 1 on core 1", "small 7 from core 1 on core 2", "text hello", "text hello"]
+        vec![
+            "big 64",
+            "big 64",
+            "small 7 from core 1 on core 1",
+            "small 7 from core 1 on core 2",
+            "text hello",
+            "text hello"
+        ]
     );
 }
 
@@ -148,7 +155,13 @@ impl Actor for UndeliveredSender {
 
 impl UndeliveredHandler<Ping> for UndeliveredSender {
     fn on_undelivered_event(&mut self, _ctx: &mut Context, dst: ActorId, _e: &Ping) {
-        let what = if dst == ActorId::NULL { "null" } else if dst == self.bouncer { "bouncer" } else { "doomed" };
+        let what = if dst == ActorId::NULL {
+            "null"
+        } else if dst == self.bouncer {
+            "bouncer"
+        } else {
+            "doomed"
+        };
         log(&self.log, format!("undelivered ping to {what}"));
     }
 }
@@ -177,7 +190,12 @@ fn undelivered_events_come_back_to_sender() {
     got.sort();
     assert_eq!(
         got,
-        vec!["undelivered ping to bouncer", "undelivered ping to doomed", "undelivered ping to null", "undelivered unhandled"]
+        vec![
+            "undelivered ping to bouncer",
+            "undelivered ping to doomed",
+            "undelivered ping to null",
+            "undelivered unhandled"
+        ]
     );
 }
 

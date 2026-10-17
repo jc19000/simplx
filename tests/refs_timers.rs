@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use simplx_rs::{
+use cannes::{
     Actor, ActorId, ActorRef, Context, Engine, Handler, NoTimerService, ReferenceError, StartSequence, Timeout, Timer,
     TimerService, TimerServiceTag,
 };
@@ -109,7 +109,10 @@ fn referenced_actor_direct_calls_and_destroyed_when_unreferenced() {
     let engine = Engine::start(seq);
     wait_for(&l, "counter destroyed at 6");
     engine.shutdown();
-    assert_eq!(lines(&l), vec!["direct add -> 5", "event add -> 6", "parent drops reference", "counter destroyed at 6"]);
+    assert_eq!(
+        lines(&l),
+        vec!["direct add -> 5", "event add -> 6", "parent drops reference", "counter destroyed at 6"]
+    );
 }
 
 /// Asks for its own destruction right away; must wait until its holder releases it.
@@ -271,7 +274,9 @@ fn singleton_is_shared_per_core_and_dropped_when_unreferenced() {
         seq.add_actor(core, move || User { singleton: None, log: l2 });
     }
     let engine = Engine::start(seq);
-    wait_until("both singletons dropped", || lines(&l).iter().filter(|x| x.starts_with("singleton dropped")).count() == 2);
+    wait_until("both singletons dropped", || {
+        lines(&l).iter().filter(|x| x.starts_with("singleton dropped")).count() == 2
+    });
     engine.shutdown();
     let got = lines(&l);
     let ids = |core: u32| -> Vec<String> {

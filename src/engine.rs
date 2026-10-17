@@ -1,4 +1,4 @@
-//! simplx-like engine: one pinned, busy-spinning event loop per core, actors owned by their core,
+//! The engine: one pinned, busy-spinning event loop per core, actors owned by their core,
 //! and a full mesh of byte rings (one per ordered pair of cores) carrying heterogeneous events.
 //!
 //! Mapping to simplx:
@@ -36,9 +36,9 @@ use std::any::{type_name, Any, TypeId};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::Rc;
 use std::mem::{align_of, size_of};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
@@ -46,13 +46,19 @@ use std::thread::{self, JoinHandle};
 use crate::affinity;
 use crate::bytering::{self, Consumer, Producer, RECORD_ALIGN};
 
+/// CPU core number, as used by the OS for pinning.
 pub type CoreId = usize;
 
+/// Address of an actor: valid on any core, compared by value. A destroyed actor's slot is reused
+/// with another `generation`, so stale ids never reach the new occupant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct ActorId {
+    /// Core the actor lives on.
     pub core: u16,
+    /// Incremented each time the slot is reused.
     pub generation: u16,
+    /// Slot of the actor on its core.
     pub index: u32,
 }
 
@@ -61,6 +67,8 @@ impl ActorId {
     pub const NULL: ActorId = ActorId { core: u16::MAX, generation: 0, index: u32::MAX };
 }
 
+/// Anything sent between actors: any `Send + 'static` type (implemented for all of them).
+/// Moved into the destination ring, handed to the handler by reference, dropped after it.
 pub trait Event: Send + 'static {}
 impl<T: Send + 'static> Event for T {}
 
@@ -77,11 +85,16 @@ pub trait Actor: 'static {
     }
 }
 
+/// Handling of events of type `E`; enable with `Context::register_handler::<E, Self>()`.
 pub trait Handler<E: Event>: Actor {
+    /// Called on the actor's core for each `E` sent to it; `src` is the sender.
     fn on_event(&mut self, ctx: &mut Context, src: ActorId, event: &E);
 }
 
+/// Handling of this actor's events of type `E` that could not be delivered (no such actor, no
+/// handler, or `return_to_sender`); enable with `Context::register_undelivered_handler`.
 pub trait UndeliveredHandler<E: Event>: Actor {
+    /// Called with the event and the destination it did not reach.
     fn on_undelivered_event(&mut self, ctx: &mut Context, dst: ActorId, event: &E);
 }
 
@@ -329,10 +342,12 @@ pub struct ActorRef<A: Actor> {
 }
 
 impl<A: Actor> ActorRef<A> {
+    /// Id of the referenced actor, to send it events.
     pub fn id(&self) -> ActorId {
         self.id
     }
 
+    /// Shared access to the actor; panics if it is running.
     pub fn borrow(&self) -> Ref<'_, A> {
         match self.cell.try_borrow() {
             Ok(actor) => actor,
@@ -340,6 +355,8 @@ impl<A: Actor> ActorRef<A> {
         }
     }
 
+    /// Exclusive access to the actor, to call its methods directly; panics if it is running
+    /// (re-entrant call).
     pub fn borrow_mut(&self) -> RefMut<'_, A> {
         enter(&self.cell)
     }
@@ -359,11 +376,16 @@ impl<A: Actor> Drop for ActorRef<A> {
     }
 }
 
+/// Why `Context::reference_local_actor` failed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReferenceError {
+    /// The actor lives on another core.
     NotLocal,
+    /// No live actor has this id.
     NotFound,
+    /// The actor is not an `A`.
     WrongType,
+    /// The actor already references the caller, directly or not (or is the caller).
     Circular,
 }
 
@@ -392,6 +414,7 @@ struct HandlerRegistration {
 /// Per-core performance counters (simplx `CorePerformanceCounters`). All cumulative.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoreCounters {
+    /// Core these counters belong to.
     pub core: CoreId,
     /// Event-loop iterations.
     pub loop_total: u64,
@@ -459,16 +482,20 @@ pub struct Context {
 }
 
 impl Context {
+    /// Id of the actor being called.
     #[inline]
     pub fn id(&self) -> ActorId {
         self.current
     }
 
+    /// Core of this event loop.
     #[inline]
     pub fn core(&self) -> CoreId {
         self.core as CoreId
     }
 
+    /// Sends `event` to `dst`, on this core or another. Remote events are published at the end of
+    /// the loop iteration or on `flush`; events from one actor to another arrive in order.
     #[inline]
     pub fn send<E: Event>(&mut self, dst: ActorId, event: E) {
         self.send_from(self.current, dst, event);
@@ -494,6 +521,7 @@ impl Context {
         self.effects = true;
     }
 
+    /// Undelivered handler of this actor's type for its own events of type `E`.
     pub fn register_undelivered_handler<E: Event, A: UndeliveredHandler<E>>(&mut self) {
         self.registrations.push(HandlerRegistration {
             index: self.current.index,
@@ -596,6 +624,7 @@ impl Context {
         self.callbacks.push(self.current);
     }
 
+    /// Id of the service registered under `Tag` in the start sequence.
     pub fn service<Tag: 'static>(&self) -> Option<ActorId> {
         self.shared.0.services.get(&TypeId::of::<Tag>()).copied()
     }
@@ -694,6 +723,7 @@ struct StartEntry {
     factory: Box<dyn FnOnce() -> NewActor + Send>,
 }
 
+/// The cores and actors to start the engine with (simplx `Engine::StartSequence`).
 pub struct StartSequence {
     entries: Vec<StartEntry>,
     per_core: Vec<u32>,
@@ -709,8 +739,15 @@ impl Default for StartSequence {
 }
 
 impl StartSequence {
+    /// An empty sequence with 64 KiB rings.
     pub fn new() -> Self {
-        Self { entries: Vec::new(), per_core: Vec::new(), used: Vec::new(), services: HashMap::new(), ring_capacity: 64 * 1024 }
+        Self {
+            entries: Vec::new(),
+            per_core: Vec::new(),
+            used: Vec::new(),
+            services: HashMap::new(),
+            ring_capacity: 64 * 1024,
+        }
     }
 
     /// Size in bytes of each inter-core ring.
@@ -744,7 +781,12 @@ impl StartSequence {
         id
     }
 
-    fn push<A: Actor, F: FnOnce() -> A + Send + 'static>(&mut self, core: CoreId, service: bool, factory: F) -> ActorId {
+    fn push<A: Actor, F: FnOnce() -> A + Send + 'static>(
+        &mut self,
+        core: CoreId,
+        service: bool,
+        factory: F,
+    ) -> ActorId {
         self.add_core(core);
         let id = ActorId { core: core as u16, generation: 0, index: self.per_core[core] };
         self.per_core[core] += 1;
@@ -753,6 +795,7 @@ impl StartSequence {
     }
 }
 
+/// A running engine: one pinned event-loop thread per core of the start sequence.
 pub struct Engine {
     shared: Arc<PaddedShared>,
     threads: Vec<JoinHandle<()>>,
@@ -858,8 +901,8 @@ struct Slot {
     actor_type: TypeId,
     generation: u16,
     service: bool,
-    auto_destroy: bool,          // destroy once unreferenced
-    destroy_deferred: bool,      // destroy requested while referenced
+    auto_destroy: bool,     // destroy once unreferenced
+    destroy_deferred: bool, // destroy requested while referenced
     singleton: Option<TypeId>,
     destroy_pending: bool,
     callback_iteration: u64,
@@ -1023,7 +1066,11 @@ impl Actors {
             for (index, slot) in self.slots.iter_mut().enumerate() {
                 if slot.cell.is_some() && !slot.destroy_pending && (!slot.service || services_too) {
                     slot.destroy_pending = true;
-                    ctx.destroy_requests.push(ActorId { core: ctx.core, generation: slot.generation, index: index as u32 });
+                    ctx.destroy_requests.push(ActorId {
+                        core: ctx.core,
+                        generation: slot.generation,
+                        index: index as u32,
+                    });
                 }
             }
         }

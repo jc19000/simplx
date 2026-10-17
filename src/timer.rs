@@ -51,6 +51,7 @@ pub struct TimerService {
 }
 
 impl TimerService {
+    /// A service with no client yet.
     pub fn new() -> Self {
         Self::default()
     }
@@ -105,6 +106,7 @@ struct Entry {
     period: Option<Duration>,
 }
 
+/// Per-core singleton holding the timers of its core; created and referenced by `Timer::new`.
 pub struct TimerHub {
     id: ActorId,
     service: ActorId,
@@ -193,6 +195,7 @@ impl Handler<Tick> for TimerHub {
 
 // ---- Timer handle ------------------------------------------------------------------------------
 
+/// `Timer::new` was called but no `TimerService` was added to the start sequence.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NoTimerService;
 
@@ -213,6 +216,7 @@ pub struct Timer {
 }
 
 impl Timer {
+    /// A new, unarmed timer owned by the current actor.
     pub fn new(ctx: &mut Context) -> Result<Timer, NoTimerService> {
         let service = ctx.service::<TimerServiceTag>().ok_or(NoTimerService)?;
         let hub = ctx.singleton(|| TimerHub::new(service));
@@ -236,10 +240,12 @@ impl Timer {
         self.hub.borrow_mut().arm(ctx, self.slot, owner, Instant::now() + period, Some(period));
     }
 
+    /// Cancels the timer; a `Timeout` already sent is ignored by `is`.
     pub fn unset(&self) {
         self.hub.borrow_mut().disarm(self.slot);
     }
 
+    /// Whether the timer is armed.
     pub fn is_set(&self) -> bool {
         self.hub.borrow().entries[self.slot as usize].deadline.is_some()
     }

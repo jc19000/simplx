@@ -1,19 +1,19 @@
-//! Inter-core round-trip latency benchmark, mirroring bench/pingpong_cpp/pingpong_bench.cpp.
+//! Inter-core round-trip latency benchmark, mirroring bench/simplx-cpp/pingpong_bench.cpp.
 //!
-//! - `engine`: Ping actor (core A) and Pong service (core B) on the simplx-like engine.
+//! - `engine`: Ping actor (core A) and Pong service (core B) on the engine.
 //! - `raw`: two bare pinned threads and two SPSC rings, no engine: the floor for this hardware.
 //!
 //! One event in flight at a time; each round trip is timed with rdtsc, calibrated against
 //! `Instant` over the run.
 //!
-//! usage: pingpong_bench [iterations=1000000] [warmup=100000] [ping_core=1] [pong_core=2] [engine|raw]
+//! usage: cargo run --release --example pingpong -- [iterations=1000000] [warmup=100000] [ping_core=1] [pong_core=2] [engine|raw]
 
 use std::arch::x86_64::_rdtsc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use simplx_rs::{affinity, spsc, Actor, ActorId, Context, Engine, Handler, StartSequence};
+use cannes::{affinity, spsc, Actor, ActorId, Context, Engine, Handler, StartSequence};
 
 #[derive(Clone, Copy)]
 struct PingEvent {
@@ -171,7 +171,7 @@ fn main() {
     let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / samples.len() as f64 * ns_per_tick;
     let total_ns = results.total_ticks as f64 * ns_per_tick;
 
-    println!("impl=rust-{mode} iterations={} cores={ping_core},{pong_core}", samples.len());
+    println!("impl=cannes-{mode} iterations={} cores={ping_core},{pong_core}", samples.len());
     println!(
         "rtt_ns min={:.0} p50={:.0} p90={:.0} p99={:.0} p99.9={:.0} p99.99={:.0} max={:.0} mean={:.1}",
         pct(0.0),

@@ -53,12 +53,10 @@ pub fn channel<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         mask: capacity - 1,
         buf,
     });
-    (
-        Producer { ring: ring.clone(), tail: 0, head_cache: 0 },
-        Consumer { ring, head: 0, tail_cache: 0 },
-    )
+    (Producer { ring: ring.clone(), tail: 0, head_cache: 0 }, Consumer { ring, head: 0, tail_cache: 0 })
 }
 
+/// Writing end of a typed SPSC ring (one thread).
 #[repr(align(128))]
 pub struct Producer<T> {
     ring: Arc<Ring<T>>,
@@ -88,6 +86,7 @@ impl<T> Producer<T> {
         self.ring.tail.0.store(self.tail, Ordering::Release);
     }
 
+    /// `write` then `commit`; gives the value back if the ring is full.
     #[inline]
     pub fn push(&mut self, value: T) -> Result<(), T> {
         self.write(value)?;
@@ -102,6 +101,7 @@ impl<T> Drop for Producer<T> {
     }
 }
 
+/// Reading end of a typed SPSC ring (one thread).
 #[repr(align(128))]
 pub struct Consumer<T> {
     ring: Arc<Ring<T>>,
@@ -124,11 +124,13 @@ impl<T> Consumer<T> {
         Some(value)
     }
 
+    /// Hands the slots of every item read so far back to the producer.
     #[inline]
     pub fn release(&mut self) {
         self.ring.head.0.store(self.head, Ordering::Release);
     }
 
+    /// `read` then `release`.
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         let value = self.read()?;

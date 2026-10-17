@@ -1,162 +1,175 @@
-# simplx-rs : PoC d'un moteur d'acteurs façon simplx en Rust
+# cannes
 
-Objectif : comparer la latence aller-retour inter-cœurs (ping-pong, un seul événement en vol) entre
-simplx (C++) et un équivalent Rust, en se rapprochant progressivement des fonctionnalités de simplx.
+**A thread-per-core actor engine for Rust, built for low latency.** One pinned, busy-polling
+event loop per CPU core; actors that never leave their core; lock-free SPSC rings between cores.
+About **600 ns per inter-core round trip**, within 10 to 20 ns of the hardware floor, and about
+**2× faster than the C++ framework it is modelled on** ([Tredzone simplx](https://github.com/Tredzone/simplx)).
 
-## Fonctionnalités et correspondance avec simplx
+[![CI](https://github.com/jc19000/cannes/actions/workflows/ci.yml/badge.svg)](https://github.com/jc19000/cannes/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/cannes.svg)](https://crates.io/crates/cannes)
+[![docs.rs](https://docs.rs/cannes/badge.svg)](https://docs.rs/cannes)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-| simplx | simplx-rs |
-|---|---|
-| sous-classe d'`Actor::Event` | n'importe quel type `Send + 'static` (taille variable, alignement ≤ 16) |
-| `registerEventHandler<E>(*this)` / `onEvent(const E&)` | `ctx.register_handler::<E, Self>()` / `Handler<E>::on_event(&mut self, ctx, src, &E)` |
-| `Event::Pipe(*this, dst).push<E>(...)` | `ctx.send(dst, event)` |
-| `registerUndeliveredEventHandler<E>` / `onUndeliveredEvent` | `ctx.register_undelivered_handler::<E, Self>()` / `UndeliveredHandler<E>` |
-| `throw ReturnToSenderException()` | `ctx.return_to_sender()` |
-| `newUnreferencedActor<A>()` | `ctx.new_actor(actor)` |
-| `newReferencedActor<A>()` / `ActorReference<A>` | `ctx.new_referenced_actor(actor)` / `ActorRef<A>` (appel direct : `r.borrow_mut().methode()`) |
-| `referenceLocalActor<A>(id)` (`CircularReferenceException`) | `ctx.reference_local_actor::<A>(id)` (`Err(ReferenceError::Circular)`, etc.) |
-| `newReferencedSingletonActor<A>()` | `ctx.singleton(\|\| actor)` |
-| `TimerActor` (service `service::Timer`) / `TimerProxy` / `onTimeout()` | `TimerService` (service `TimerServiceTag`) / `Timer` / événement `Timeout` |
-| `requestDestroy()` / `onDestroyRequest()` / `acceptDestroy()` | `ctx.request_destroy()` / `on_destroy_request() -> bool` |
-| `registerCallback(*this)` / `onCallback()` | `ctx.register_callback()` / `on_callback()` |
-| `addServiceActor<Tag, A>(core)` / `getServiceActorId<Tag>()` | `add_service::<Tag, _, _>(core, f)` / `ctx.service::<Tag>()` |
-| destructeur de `Engine` (acteurs ordinaires détruits d'abord, services ensuite) | `Engine::shutdown()` / `Drop`, même ordre |
-| `getCorePerformanceCounters()` | `ctx.counters()` dans un acteur, `Engine::counters()` depuis l'extérieur, `Engine::shutdown()` renvoie les valeurs finales |
-| publication en fin de tour de boucle | idem, plus `ctx.flush()` pour publier immédiatement |
+Use it for trading systems, matching engines, market-data handlers, packet processing, game
+servers: anything where you would rather dedicate cores than share them, and where a
+microsecond matters. No async runtime, no work stealing, no locks on the hot path, no
+dependencies.
 
-Sémantique des références, identique à simplx : un acteur référencé n'est pas détruit tant qu'une
-référence existe (sa demande de destruction est différée). Un acteur créé par
-`new_referenced_actor` ou `singleton` est détruit quand sa dernière référence disparaît. Une
-référence circulaire est refusée. En plus de simplx : `ActorRef` n'est pas `Send`, donc le
-compilateur interdit de la faire sortir de son cœur. Chaque acteur vit dans un `Rc<RefCell<A>>`, si
-bien qu'un appel réentrant (A appelle B qui rappelle A) provoque un panic explicite au lieu
-d'aliaser `&mut A`.
+## Why thread-per-core
 
-Timers, même architecture que simplx : un `TimerService` sur un cœur garde une échéance par cœur
-client et teste l'horloge par callback tant qu'il en reste une. Un `TimerHub` singleton par cœur
-gère tous les timers du cœur et ne demande au service que la prochaine échéance, si bien qu'un seul
-message traverse les cœurs par tick. Une différence : à l'expiration, le propriétaire reçoit un
-événement `Timeout` (à distinguer avec `timer.is(&t)`, qui ignore aussi un timeout envoyé avant un
-réarmement ou un `unset`) au lieu d'un appel direct à `onTimeout()`. Un appel direct depuis le hub
-laisserait `onTimeout` réarmer un timer pendant que le hub s'exécute, donc aliaser le hub.
+General-purpose actor frameworks (actix, ractor, kameo…) run on async runtimes such as tokio:
+actors migrate between threads, mailboxes are multi-producer queues, and every message wakes a
+task. That is flexible, and it costs microseconds.
 
-Compteurs par cœur (`CoreCounters`), ceux de simplx plus le nombre de publications :
-`loop_total` (tours de boucle), `loop_usage` (tours avec au moins un callback d'acteur :
-`loop_usage / loop_total` donne la saturation du cœur), `events`, `callbacks`, `publications`
-(stores Release de `tail` : événements envoyés / publications donne le facteur de batching) et
-`bytes_written_to[cœur]`. Ce sont des `u64` locaux au cœur, sans atomique sur le chemin critique.
-Une copie est publiée tous les 4096 tours dans un `Mutex` par cœur via `try_lock` (jamais
-d'attente), pour la lecture depuis un thread de monitoring.
+`cannes` takes the opposite trade-off, the one of Seastar, LMAX-style designs and simplx:
 
-Flush : les événements d'un tour de boucle sont publiés à la fin du tour (un store par cœur
-destinataire). `ctx.flush()` les publie immédiatement, par exemple avant un calcul long dans un
-handler. Les événements en débordement d'un ring plein restent en attente jusqu'à la fin du tour.
+- **Each core owns its actors.** Actor state is plain Rust: no `Mutex`, no `Arc`, no atomics, no
+  `Send` bound. The cache stays hot because nothing else touches it.
+- **Cores never contend.** Each ordered pair of cores has its own single-producer /
+  single-consumer ring, so no queue ever has two writers and no compare-and-swap is needed.
+- **Batched publication.** Events sent during a loop iteration are published with one Release
+  store per destination core at the end of the iteration, or immediately with `ctx.flush()`.
+- **Zero-copy delivery.** Handlers get a reference into the ring itself.
+- **Predictable.** The loop busy-polls on a pinned core: no syscalls, no OS scheduler, no
+  wake-ups on the event path.
 
-Volontairement non couverts : priorités de handlers, `BufferedPipe` et pushs atomiques groupés,
-`registerPerformanceNeutralCallback`, red zone, connecteurs entre processus.
-
-## Contenu
-
-| Fichier | Rôle |
-|---|---|
-| `src/bytering.rs` | Ring SPSC d'enregistrements de taille variable, alignés sur 16 octets, avec un enregistrement de padding au bouclage pour garder chaque enregistrement contigu. Index `head`/`tail` sur des lignes de cache séparées, copie locale de l'index distant, publication par lots. |
-| `src/engine.rs` | Le moteur : une boucle épinglée en spin actif par cœur, un ring par paire orientée de cœurs. Le handler reçoit `&E` qui pointe directement dans le ring (aucune copie à la livraison). Les événements d'un tour de boucle sont publiés en une fois à la fin du tour. |
-| `src/timer.rs` | `TimerService`, `TimerHub` (singleton par cœur) et `Timer`. |
-| `src/spsc.rs` | Ring SPSC typé, utilisé par le mode `raw` du benchmark. |
-| `src/affinity.rs` | Épinglage via `sched_setaffinity`, sans dépendance. |
-| `tests/engine.rs` | Un test par fonctionnalité : événements hétérogènes en local et entre cœurs, les quatre cas d'événement non délivré, protocole de destruction et callbacks, ordre d'arrêt services/acteurs, débordement d'un ring plein (ordre préservé), aucun événement perdu sans être détruit (y compris ceux en vol à l'arrêt), flush manuel (événement reçu pendant que l'émetteur est occupé, contre 40 ms d'attente sans flush), exactitude des compteurs. |
-| `tests/refs_timers.rs` | Appel direct par référence, destruction différée tant qu'un acteur est référencé puis automatique quand il ne l'est plus, erreurs de référence (circulaire, mauvais type, autre cœur), singleton partagé par cœur et distinct entre cœurs, timers (one-shot, répétition, `unset`, jamais en avance), absence de service, arrêt avec timers armés sur plusieurs cœurs. |
-| `src/bin/pingpong_bench.rs` | Benchmark, modes `engine` (Ping et service Pong) et `raw` (deux threads et deux rings, sans moteur : le plancher matériel). |
-| `../bench/pingpong_cpp/` | Le même benchmark avec simplx, modes `spin` (core-actor sans `threadYield()`) et `yield` (`DefaultCoreActor`). |
-| `../bench/run_pingpong.sh` | Compile les deux benchmarks et les exécute en alternance. |
-
-Aucune dépendance externe. `cargo test --release` lance 22 tests.
-
-## Lancer
-
-```sh
-bench/run_pingpong.sh [reps=5] [iterations=1000000] [ping_core=1] [pong_core=2]
+```mermaid
+flowchart LR
+    subgraph C1["core 1: pinned event loop"]
+        A1[actor] --- A2[actor]
+    end
+    subgraph C2["core 2: pinned event loop"]
+        B1[actor] --- B2[actor]
+    end
+    subgraph C3["core 3: pinned event loop"]
+        D1[actor]
+    end
+    C1 -- "SPSC ring 1→2" --> C2
+    C2 -- "SPSC ring 2→1" --> C1
+    C1 -- "1→3" --> C3
+    C3 -- "3→1" --> C1
+    C2 -- "2→3" --> C3
+    C3 -- "3→2" --> C2
 ```
 
-Méthode : 100 k allers-retours d'échauffement puis 1 M mesurés, chacun chronométré avec `rdtsc`
-(TSC calibré sur l'horloge monotone). Message de 16 octets. Dans les deux langages, le moteur n'est
-arrêté qu'après la fin des mesures.
+Each loop iteration: drain the inbound rings and dispatch each event to its handler, dispatch
+same-core events, run callbacks and destroy requests, then publish everything sent to other cores.
 
-## Résultats (2026-10-17)
+## Example
 
-Machine : VM KVM, 4 vCPU Intel Xeon (Sapphire Rapids, 2,1 GHz), Ubuntu 24.04, gcc 13.3 `-O3
--march=native`, rustc 1.97 `opt-level=3`, LTO, `target-cpu=native`. Médiane de 5 exécutions
-entrelacées, cœurs 1 et 2, latences en ns :
+```rust
+use cannes::{Actor, ActorId, Context, Engine, Handler, StartSequence};
 
-| impl | min | p50 | p90 | p99 | moyenne | allers-retours/s |
-|---|---:|---:|---:|---:|---:|---:|
-| simplx spin | 783 | 1342 | 1477 | 3977 | 1464 | 549 k |
-| simplx yield | 696 | 1477 | 1698 | 4638 | 1660 | 497 k |
-| **simplx-rs** | 194 | **612** | 782 | 998 | 688 | 1209 k |
-| rust raw (plancher) | 152 | 597 | 771 | 926 | 684 | 1249 k |
+struct Ping(u64);
 
-(Version avec références, singletons et timers. Avant, sans ces fonctionnalités : simplx-rs p50 593
-contre 573 pour le plancher, cœurs 0 et 3 : simplx spin 1357, simplx-rs 599, raw 588.)
+struct Pong;
+impl Actor for Pong {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<Ping, Self>();
+    }
+}
+impl Handler<Ping> for Pong {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, ping: &Ping) {
+        ctx.send(src, Ping(ping.0 + 1)); // back to the sender, on its own core
+    }
+}
 
-Le moteur Rust ajoute 10 à 20 ns au plancher, simplx environ 750 ns.
+struct Starter { pong: ActorId }
+impl Actor for Starter {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<Ping, Self>();
+        ctx.send(self.pong, Ping(0));
+    }
+}
+impl Handler<Ping> for Starter {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, ping: &Ping) {
+        if ping.0 < 1_000_000 {
+            ctx.send(src, Ping(ping.0 + 1));
+        }
+    }
+}
 
-Compteurs et flush manuel : A/B en alternance de la version d'avant et de la nouvelle, sur 6
-exécutions chacune, p50 512 à 535 ns contre 517 à 533 ns : aucun coût mesurable. Les compteurs
-d'un run de ping-pong confirment le fonctionnement : 1,1 M événements, 1,1 M publications (un
-événement en vol à la fois, donc pas de batching), environ 60 à 70 M tours de boucle par cœur
-pour 1,1 M tours utiles (saturation d'environ 2 %).
+fn main() {
+    let mut sequence = StartSequence::new();
+    let pong = sequence.add_actor(2, || Pong);              // loop pinned to core 2
+    sequence.add_actor(1, move || Starter { pong });        // loop pinned to core 1
+    let engine = Engine::start(sequence);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    for c in engine.shutdown() {                            // final per-core counters
+        println!("core {}: {} events, {}/{} busy loops", c.core, c.events, c.loop_usage, c.loop_total);
+    }
+}
+```
 
-À noter pendant l'ajout des références : vider la liste des acteurs déréférencés à chaque tour de
-boucle (emprunt du `RefCell`, `mem::take` du `Vec`) faisait passer le min de 190 à 370 ns et le p50
-d'environ 40 ns, alors que ce sont quelques écritures locales, sans partage de ligne de cache
-(vérifié par les adresses). C'est remplacé par la lecture d'un `Cell<bool>` qui n'est écrit que
-lorsqu'une référence disparaît. Sur un chemin critique de quelques dizaines d'instructions, chaque
-écriture par tour de boucle se voit.
+```toml
+[dependencies]
+cannes = "0.1"
+```
 
-## D'où venaient les 300 ns du premier PoC
+## Features
 
-La première version du moteur était environ 300 ns au-dessus du mode `raw`. Ce n'était pas le coût
-de la boucle sur les rings, mais du false sharing. Les états locaux `Producer` (cœur 1 → 2) et
-`Producer` (cœur 2 → 1), modifiés à chaque envoi, étaient sur la même ligne de cache. Ils avaient
-été alloués côte à côte par le thread principal, et un `Vec` déplacé vers un autre thread garde son
-buffer. Chaque envoi invalidait donc la ligne de l'autre cœur, dans les deux sens. En mode `raw`,
-chaque thread possède sa propre extrémité, d'où l'absence du problème. Correction : `Producer` et
-`Consumer` sont alignés sur 128 octets.
+| | |
+|---|---|
+| **Events** | Any `Send + 'static` type, any size; per-type handlers; in-order delivery between two actors |
+| **Undelivered events** | Come back to the sender (no such actor, no handler, or `ctx.return_to_sender()`) |
+| **Lifecycle** | Start actors per core, dynamic creation, a destroy protocol an actor can postpone, end-of-iteration callbacks |
+| **Services** | Actors reachable by tag from any core |
+| **Direct calls** | `ActorRef<A>`: synchronous method calls between actors of the same core, destruction blocked while referenced, circular references refused, per-core singletons |
+| **Timers** | One timer service, one hub per core, one cross-core event per tick whatever the number of timers |
+| **Flush** | End-of-iteration publication, plus `ctx.flush()` to publish immediately |
+| **Counters** | Per core: loop iterations, busy iterations (saturation), events, callbacks, ring publications (batching factor), bytes per destination core |
+| **Shutdown** | Regular actors first, then services; every in-flight event is dropped exactly once |
 
-## Pourquoi simplx est plus lent (analyse du code, pas mesuré finement)
+### What the compiler checks for you
 
-simplx n'utilise pas de ring entre deux cœurs : il utilise une poignée de main à une seule boîte aux
-lettres (`include/trz/engine/internal/parallel.h`, `node.h`) :
+These are conventions in a C++ framework; here they are compile-time or checked guarantees:
 
-1. Le cœur écrivain accumule ses événements dans des pages chaînées (`writeCache`).
-2. À la fin de sa boucle, il ne peut transmettre que si le lot précédent a été acquitté
-   (`isWriteLocked == false`). Il échange alors ses chaînes avec la structure partagée
-   `ReadWriteLocked` (plusieurs champs sur plus d'une ligne de cache, cf. le `TODO make it all fit
-   in one cache line`), recycle les pages rendues, puis fait un `mfence` et passe
-   `isWriteLocked = true`.
-3. Le cœur lecteur voit le flag, parcourt la chaîne d'événements (des pointeurs vers des pages
-   écrites par l'autre cœur), dispatche, puis fait un `mfence` et passe `isWriteLocked = false`
-   pour acquitter.
+- An `ActorRef` is not `Send`: a direct reference cannot escape to another core.
+- Ring endpoints are a non-clonable producer and consumer: exactly one writer and one reader.
+- Cross-core events are `Send + 'static`: they cannot point into another core's memory.
+- A re-entrant call into a running actor panics instead of silently aliasing it.
 
-Par saut, cela fait voyager plusieurs lignes de cache (flag, structure partagée, page d'événements,
-acquittement retour, réinitialisation de la structure par l'écrivain) et coûte deux `mfence`. Le ring
-n'en fait voyager que deux : l'index `tail` et la ligne de l'enregistrement. Avec 60 à 100 ns par
-transfert de ligne sur cette machine, cela explique l'ordre de grandeur des environ 390 ns de plus
-par saut. Ce protocole a des avantages réels : nombre de lots en vol illimité sans capacité fixe,
-détection d'un cœur arrêté (`writeFailed`), pas de taille maximale d'événement. Mais il est
-structurellement plus coûteux en latence qu'un ring. Une confirmation fine demanderait
-`perf c2c` sur une machine physique.
+## Performance
 
-## Limites, à lire avant de conclure
+Inter-core round trip, one event in flight (ping-pong between two cores), 1 M measured round trips
+after 100 k warm-up, `rdtsc` timing, median of 5 interleaved runs:
 
-- **L'environnement est bruité.** La VM est partagée, sans `isolcpus`, sans `nohz_full`, sans
-  contrôle de fréquence, et le placement des vCPU sur les cœurs physiques est inconnu. Les queues
-  (p99.9 et au-delà) reflètent surtout l'hyperviseur : ne comparez que p50 et p90. Certaines
-  exécutions isolées sortent des valeurs aberrantes (p50 autour de 100 à 200 ns), probablement deux
-  vCPU sur le même cœur physique. À refaire sur une machine bare metal réglée pour la basse latence.
-- **Différences de comportement qui restent :** le ring a une capacité fixe (64 Kio par défaut,
-  avec un débordement local en cas de ring plein) et une taille maximale d'événement (la moitié du
-  ring). Les erreurs dans les handlers ne sont pas interceptées (un panic arrête le processus,
-  `panic = "abort"`), alors que simplx attrape les exceptions par handler.
-- **Débit :** il est calculé sur le temps total de la phase mesurée. Il inclut donc le temps passé
-  dans Ping entre la réception et le renvoi.
+| | p50 | p90 | p99 | round trips/s |
+|---|---:|---:|---:|---:|
+| simplx (C++), busy-spin loop | 1342 ns | 1477 ns | 3977 ns | 549 k |
+| simplx (C++), default loop | 1477 ns | 1698 ns | 4638 ns | 497 k |
+| **cannes** | **612 ns** | **782 ns** | **998 ns** | **1209 k** |
+| two bare threads on the same rings (floor) | 597 ns | 771 ns | 926 ns | 1249 k |
+
+KVM cloud VM, 4 vCPU Intel Xeon (Sapphire Rapids, 2.1 GHz), not tuned: no `isolcpus`, unknown vCPU
+placement. Only trust p50/p90 here, and rerun on your own hardware:
+
+```sh
+bench/run.sh            # cannes vs. bare threads
+bench/compare_simplx.sh # also builds simplx and runs the same benchmark in C++
+```
+
+Why simplx is slower, how a false-sharing bug once cost 300 ns per round trip, and what one
+extra write per loop iteration costs: [docs/DESIGN.md](docs/DESIGN.md).
+
+## Status and limits
+
+- Young (0.1): API may change. 22 tests, including cross-core stress, overflow ordering, and
+  drop accounting at shutdown.
+- Linux for thread pinning (elsewhere, loops run unpinned). Busy-polling: each engine core runs
+  at 100 % by design.
+- Bounded rings (64 KiB by default) with local overflow when full; an event can be at most half a
+  ring.
+- A panic in a handler aborts the process; there is no per-handler error isolation.
+- In-process only: no inter-process transport yet.
+
+## Coming from simplx
+
+`cannes` follows simplx's model closely: start sequence, `registerEventHandler`, `Event::Pipe`,
+undelivered events, `requestDestroy`/`onDestroyRequest`, services, `ActorReference`, singletons,
+`TimerProxy`, core performance counters. See [docs/SIMPLX.md](docs/SIMPLX.md) for the
+one-to-one mapping. It is an independent implementation in Rust; no simplx code is used.
+
+## License
+
+Apache-2.0.

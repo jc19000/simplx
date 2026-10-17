@@ -1,9 +1,16 @@
 [package]
-name = "simplx-rs"
+name = "cannes"
 version = "0.1.0"
 edition = "2021"
-description = "PoC: simplx-like per-core actor engine in Rust, for latency comparison with simplx"
+rust-version = "1.82"
+description = "Thread-per-core actor engine for low-latency systems: pinned busy-polling event loops, lock-free SPSC rings between cores, ~600 ns inter-core round trip. Inspired by Tredzone simplx."
 license = "Apache-2.0"
+repository = "https://github.com/jc19000/cannes"
+documentation = "https://docs.rs/cannes"
+readme = "README.md"
+keywords = ["actor", "thread-per-core", "low-latency", "lock-free", "spsc"]
+categories = ["concurrency", "data-structures", "finance"]
+exclude = ["/bench", "/.github"]
 
 [dependencies]
 
@@ -13,3 +20,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = 1
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
