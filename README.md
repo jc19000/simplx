@@ -21,6 +21,8 @@ simplx (C++) et un équivalent Rust, en se rapprochant progressivement des fonct
 | `registerCallback(*this)` / `onCallback()` | `ctx.register_callback()` / `on_callback()` |
 | `addServiceActor<Tag, A>(core)` / `getServiceActorId<Tag>()` | `add_service::<Tag, _, _>(core, f)` / `ctx.service::<Tag>()` |
 | destructeur de `Engine` (acteurs ordinaires détruits d'abord, services ensuite) | `Engine::shutdown()` / `Drop`, même ordre |
+| `getCorePerformanceCounters()` | `ctx.counters()` dans un acteur, `Engine::counters()` depuis l'extérieur, `Engine::shutdown()` renvoie les valeurs finales |
+| publication en fin de tour de boucle | idem, plus `ctx.flush()` pour publier immédiatement |
 
 Sémantique des références, identique à simplx : un acteur référencé n'est pas détruit tant qu'une
 référence existe (sa demande de destruction est différée). Un acteur créé par
@@ -38,8 +40,20 @@ message traverse les cœurs par tick. Une différence : à l'expiration, le prop
 réarmement ou un `unset`) au lieu d'un appel direct à `onTimeout()`. Un appel direct depuis le hub
 laisserait `onTimeout` réarmer un timer pendant que le hub s'exécute, donc aliaser le hub.
 
-Pas encore couverts : `BufferedPipe` et pushs atomiques groupés, `registerPerformanceNeutralCallback`,
-connecteurs entre processus.
+Compteurs par cœur (`CoreCounters`), ceux de simplx plus le nombre de publications :
+`loop_total` (tours de boucle), `loop_usage` (tours avec au moins un callback d'acteur :
+`loop_usage / loop_total` donne la saturation du cœur), `events`, `callbacks`, `publications`
+(stores Release de `tail` : événements envoyés / publications donne le facteur de batching) et
+`bytes_written_to[cœur]`. Ce sont des `u64` locaux au cœur, sans atomique sur le chemin critique.
+Une copie est publiée tous les 4096 tours dans un `Mutex` par cœur via `try_lock` (jamais
+d'attente), pour la lecture depuis un thread de monitoring.
+
+Flush : les événements d'un tour de boucle sont publiés à la fin du tour (un store par cœur
+destinataire). `ctx.flush()` les publie immédiatement, par exemple avant un calcul long dans un
+handler. Les événements en débordement d'un ring plein restent en attente jusqu'à la fin du tour.
+
+Volontairement non couverts : priorités de handlers, `BufferedPipe` et pushs atomiques groupés,
+`registerPerformanceNeutralCallback`, red zone, connecteurs entre processus.
 
 ## Contenu
 
@@ -50,13 +64,13 @@ connecteurs entre processus.
 | `src/timer.rs` | `TimerService`, `TimerHub` (singleton par cœur) et `Timer`. |
 | `src/spsc.rs` | Ring SPSC typé, utilisé par le mode `raw` du benchmark. |
 | `src/affinity.rs` | Épinglage via `sched_setaffinity`, sans dépendance. |
-| `tests/engine.rs` | Un test par fonctionnalité : événements hétérogènes en local et entre cœurs, les quatre cas d'événement non délivré, protocole de destruction et callbacks, ordre d'arrêt services/acteurs, débordement d'un ring plein (ordre préservé), aucun événement perdu sans être détruit (y compris ceux en vol à l'arrêt). |
+| `tests/engine.rs` | Un test par fonctionnalité : événements hétérogènes en local et entre cœurs, les quatre cas d'événement non délivré, protocole de destruction et callbacks, ordre d'arrêt services/acteurs, débordement d'un ring plein (ordre préservé), aucun événement perdu sans être détruit (y compris ceux en vol à l'arrêt), flush manuel (événement reçu pendant que l'émetteur est occupé, contre 40 ms d'attente sans flush), exactitude des compteurs. |
 | `tests/refs_timers.rs` | Appel direct par référence, destruction différée tant qu'un acteur est référencé puis automatique quand il ne l'est plus, erreurs de référence (circulaire, mauvais type, autre cœur), singleton partagé par cœur et distinct entre cœurs, timers (one-shot, répétition, `unset`, jamais en avance), absence de service, arrêt avec timers armés sur plusieurs cœurs. |
 | `src/bin/pingpong_bench.rs` | Benchmark, modes `engine` (Ping et service Pong) et `raw` (deux threads et deux rings, sans moteur : le plancher matériel). |
 | `../bench/pingpong_cpp/` | Le même benchmark avec simplx, modes `spin` (core-actor sans `threadYield()`) et `yield` (`DefaultCoreActor`). |
 | `../bench/run_pingpong.sh` | Compile les deux benchmarks et les exécute en alternance. |
 
-Aucune dépendance externe. `cargo test --release` lance 20 tests.
+Aucune dépendance externe. `cargo test --release` lance 22 tests.
 
 ## Lancer
 
@@ -85,6 +99,12 @@ entrelacées, cœurs 1 et 2, latences en ns :
 contre 573 pour le plancher, cœurs 0 et 3 : simplx spin 1357, simplx-rs 599, raw 588.)
 
 Le moteur Rust ajoute 10 à 20 ns au plancher, simplx environ 750 ns.
+
+Compteurs et flush manuel : A/B en alternance de la version d'avant et de la nouvelle, sur 6
+exécutions chacune, p50 512 à 535 ns contre 517 à 533 ns : aucun coût mesurable. Les compteurs
+d'un run de ping-pong confirment le fonctionnement : 1,1 M événements, 1,1 M publications (un
+événement en vol à la fois, donc pas de batching), environ 60 à 70 M tours de boucle par cœur
+pour 1,1 M tours utiles (saturation d'environ 2 %).
 
 À noter pendant l'ajout des références : vider la liste des acteurs déréférencés à chaque tour de
 boucle (emprunt du `RefCell`, `mem::take` du `Vec`) faisait passer le min de 190 à 370 ns et le p50
