@@ -1,6 +1,6 @@
 //! Inter-core round-trip latency benchmark, mirroring bench/pingpong_cpp/pingpong_bench.cpp.
 //!
-//! - `engine`: Ping actor (core A) and Pong actor (core B) on the simplx-like engine.
+//! - `engine`: Ping actor (core A) and Pong service (core B) on the simplx-like engine.
 //! - `raw`: two bare pinned threads and two SPSC rings, no engine: the floor for this hardware.
 //!
 //! One event in flight at a time; each round trip is timed with rdtsc, calibrated against
@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use simplx_rs::{affinity, spsc, Actor, ActorId, Context, Engine, StartSequence};
+use simplx_rs::{affinity, spsc, Actor, ActorId, Context, Engine, Handler, StartSequence};
 
 #[derive(Clone, Copy)]
 struct PingEvent {
@@ -33,15 +33,21 @@ struct Results {
 }
 
 struct PongActor;
+struct PongTag;
 
-impl Actor<PingEvent> for PongActor {
-    fn on_event(&mut self, ctx: &mut Context<PingEvent>, src: ActorId, event: PingEvent) {
-        ctx.send(src, event);
+impl Actor for PongActor {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<PingEvent, Self>();
+    }
+}
+
+impl Handler<PingEvent> for PongActor {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, event: &PingEvent) {
+        ctx.send(src, *event);
     }
 }
 
 struct PingActor {
-    pong: ActorId,
     iterations: u64,
     warmup: u64,
     count: u64,
@@ -50,12 +56,16 @@ struct PingActor {
     report: mpsc::Sender<Results>,
 }
 
-impl Actor<PingEvent> for PingActor {
-    fn on_start(&mut self, ctx: &mut Context<PingEvent>) {
-        ctx.send(self.pong, PingEvent { seq: 0, t0: rdtsc() });
+impl Actor for PingActor {
+    fn on_start(&mut self, ctx: &mut Context) {
+        ctx.register_handler::<PingEvent, Self>();
+        let pong = ctx.service::<PongTag>().expect("pong service");
+        ctx.send(pong, PingEvent { seq: 0, t0: rdtsc() });
     }
+}
 
-    fn on_event(&mut self, ctx: &mut Context<PingEvent>, _src: ActorId, event: PingEvent) {
+impl Handler<PingEvent> for PingActor {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, event: &PingEvent) {
         let now = rdtsc();
         if self.count >= self.warmup {
             self.samples.push(now - event.t0);
@@ -66,19 +76,17 @@ impl Actor<PingEvent> for PingActor {
         if self.count == self.warmup + self.iterations {
             let samples = std::mem::take(&mut self.samples);
             let _ = self.report.send(Results { samples, total_ticks: now - self.start });
-            ctx.stop_engine();
             return;
         }
-        ctx.send(self.pong, PingEvent { seq: self.count, t0: rdtsc() });
+        ctx.send(src, PingEvent { seq: self.count, t0: rdtsc() });
     }
 }
 
 fn run_engine(iterations: u64, warmup: u64, ping_core: usize, pong_core: usize) -> Results {
     let (tx, rx) = mpsc::channel();
     let mut sequence = StartSequence::new();
-    let pong = sequence.add_actor(pong_core, || PongActor);
+    sequence.add_service::<PongTag, _, _>(pong_core, || PongActor);
     sequence.add_actor(ping_core, move || PingActor {
-        pong,
         iterations,
         warmup,
         count: 0,
@@ -86,8 +94,10 @@ fn run_engine(iterations: u64, warmup: u64, ping_core: usize, pong_core: usize) 
         samples: Vec::with_capacity(iterations as usize),
         report: tx,
     });
-    Engine::run(sequence);
-    rx.recv().expect("ping actor did not report")
+    let engine = Engine::start(sequence);
+    let results = rx.recv().expect("ping actor did not report");
+    engine.shutdown(); // after the run, as in the C++ bench
+    results
 }
 
 fn run_raw(iterations: u64, warmup: u64, ping_core: usize, pong_core: usize) -> Results {
