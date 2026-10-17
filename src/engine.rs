@@ -12,6 +12,9 @@
 //! | `registerUndeliveredEventHandler<E>`     | `ctx.register_undelivered_handler::<E, Self>()` |
 //! | `throw ReturnToSenderException()`        | `ctx.return_to_sender()`                     |
 //! | `newUnreferencedActor<A>()`              | `ctx.new_actor(actor)`                       |
+//! | `newReferencedActor<A>()` / `ActorReference<A>` | `ctx.new_referenced_actor(actor)` / `ActorRef<A>` |
+//! | `referenceLocalActor<A>(id)`             | `ctx.reference_local_actor::<A>(id)`         |
+//! | `newReferencedSingletonActor<A>()`       | `ctx.singleton(\|\| actor)`                    |
 //! | `requestDestroy()` / `onDestroyRequest()` / `acceptDestroy()` | `ctx.request_destroy()` / `on_destroy_request() -> bool` |
 //! | `registerCallback(*this)` / `onCallback()` | `ctx.register_callback()` / `on_callback()` |
 //! | `addServiceActor<Tag, A>(core)` / `getServiceActorId<Tag>()` | `add_service::<Tag, _>(core, f)` / `ctx.service::<Tag>()` |
@@ -21,9 +24,18 @@
 //! end of the iteration. Handlers receive a reference into the ring itself: no copy on delivery.
 //! On shutdown, regular actors are asked to destroy themselves first, services once no regular
 //! actor is left anywhere; the loops exit when no actor is left.
+//!
+//! Each actor lives in an `Rc<RefCell<A>>`, so that an `ActorRef<A>` (same core only: it is not
+//! `Send`) can call it directly. As in simplx, a referenced actor is not destroyed while
+//! referenced, an actor created by `new_referenced_actor` or `singleton` is destroyed once its
+//! last reference is dropped, and creating a circular reference is refused. Calling back into an
+//! actor that is already running (through a reference) panics instead of aliasing it.
 
-use std::any::TypeId;
+use std::any::{type_name, Any, TypeId};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::fmt;
+use std::rc::Rc;
 use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -163,8 +175,18 @@ impl RecordBuf {
 
 type Thunk = unsafe fn(*mut u8, &mut Context, ActorId, *const u8);
 
+/// Exclusive access to a running actor; a second access means a re-entrant call through an
+/// `ActorRef`, which would alias `&mut A`.
+#[inline]
+fn enter<A>(cell: &RefCell<A>) -> RefMut<'_, A> {
+    match cell.try_borrow_mut() {
+        Ok(actor) => actor,
+        Err(_) => panic!("actor {} re-entered while already running (call through an ActorRef)", type_name::<A>()),
+    }
+}
+
 unsafe fn event_thunk<E: Event, A: Handler<E>>(actor: *mut u8, ctx: &mut Context, src: ActorId, event: *const u8) {
-    (*(actor as *mut A)).on_event(ctx, src, &*(event as *const E));
+    enter(&*(actor as *const RefCell<A>)).on_event(ctx, src, &*(event as *const E));
 }
 
 unsafe fn undelivered_thunk<E: Event, A: UndeliveredHandler<E>>(
@@ -173,8 +195,190 @@ unsafe fn undelivered_thunk<E: Event, A: UndeliveredHandler<E>>(
     dst: ActorId,
     event: *const u8,
 ) {
-    (*(actor as *mut A)).on_undelivered_event(ctx, dst, &*(event as *const E));
+    enter(&*(actor as *const RefCell<A>)).on_undelivered_event(ctx, dst, &*(event as *const E));
 }
+
+/// Lifecycle entry points of a type-erased actor.
+trait ActorCell {
+    fn on_start(&self, ctx: &mut Context);
+    fn on_callback(&self, ctx: &mut Context);
+    fn on_destroy_request(&self, ctx: &mut Context) -> bool;
+}
+
+impl<A: Actor> ActorCell for RefCell<A> {
+    fn on_start(&self, ctx: &mut Context) {
+        enter(self).on_start(ctx)
+    }
+    fn on_callback(&self, ctx: &mut Context) {
+        enter(self).on_callback(ctx)
+    }
+    fn on_destroy_request(&self, ctx: &mut Context) -> bool {
+        enter(self).on_destroy_request(ctx)
+    }
+}
+
+/// An actor built on its core, ready to be installed in a slot.
+struct NewActor {
+    cell: Rc<dyn ActorCell>,
+    any: Rc<dyn Any>,
+    ptr: *mut u8,
+    actor_type: TypeId,
+}
+
+fn new_cell<A: Actor>(actor: A) -> (Rc<RefCell<A>>, NewActor) {
+    let cell = Rc::new(RefCell::new(actor));
+    let new = NewActor {
+        cell: cell.clone(),
+        any: cell.clone(),
+        ptr: Rc::as_ptr(&cell) as *mut u8,
+        actor_type: TypeId::of::<A>(),
+    };
+    (cell, new)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Spawn {
+    service: bool,
+    auto_destroy: bool,
+    singleton: Option<TypeId>,
+}
+
+/// Who references whom on one core (slot indexes), to block destruction of referenced actors
+/// and refuse circular references.
+#[derive(Default)]
+struct RefTable {
+    out: HashMap<u32, Vec<u32>>,
+    incoming: HashMap<u32, u32>,
+    unreferenced: Vec<u32>,
+}
+
+/// The table plus a flag the event loop can test each iteration without borrowing it.
+#[derive(Default)]
+struct Refs {
+    pending: Cell<bool>, // `table.unreferenced` is not empty
+    table: RefCell<RefTable>,
+}
+
+impl Refs {
+    fn add(&self, holder: u32, target: u32) {
+        self.table.borrow_mut().add(holder, target);
+    }
+
+    fn remove(&self, holder: u32, target: u32) {
+        let mut table = self.table.borrow_mut();
+        table.remove(holder, target);
+        if !table.unreferenced.is_empty() {
+            self.pending.set(true);
+        }
+    }
+}
+
+impl RefTable {
+    fn add(&mut self, holder: u32, target: u32) {
+        self.out.entry(holder).or_default().push(target);
+        *self.incoming.entry(target).or_default() += 1;
+    }
+
+    fn remove(&mut self, holder: u32, target: u32) {
+        if let Some(targets) = self.out.get_mut(&holder) {
+            if let Some(i) = targets.iter().position(|&t| t == target) {
+                targets.swap_remove(i);
+            }
+            if targets.is_empty() {
+                self.out.remove(&holder);
+            }
+        }
+        if let Some(count) = self.incoming.get_mut(&target) {
+            *count -= 1;
+            if *count == 0 {
+                self.incoming.remove(&target);
+                self.unreferenced.push(target);
+            }
+        }
+    }
+
+    fn is_referenced(&self, target: u32) -> bool {
+        self.incoming.contains_key(&target)
+    }
+
+    /// Whether `from` already reaches `to` through references.
+    fn reaches(&self, from: u32, to: u32) -> bool {
+        let mut stack = vec![from];
+        let mut seen = Vec::new();
+        while let Some(a) = stack.pop() {
+            if a == to {
+                return true;
+            }
+            if !seen.contains(&a) {
+                seen.push(a);
+                stack.extend(self.out.get(&a).into_iter().flatten().copied());
+            }
+        }
+        false
+    }
+}
+
+/// Direct, synchronous access to an actor on the same core (simplx `ActorReference`). The actor
+/// is not destroyed while a reference to it exists. Not `Send`: it cannot leave its core.
+pub struct ActorRef<A: Actor> {
+    cell: Rc<RefCell<A>>,
+    id: ActorId,
+    holder: u32,
+    refs: Rc<Refs>,
+}
+
+impl<A: Actor> ActorRef<A> {
+    pub fn id(&self) -> ActorId {
+        self.id
+    }
+
+    pub fn borrow(&self) -> Ref<'_, A> {
+        match self.cell.try_borrow() {
+            Ok(actor) => actor,
+            Err(_) => panic!("actor {} is running and cannot be borrowed", type_name::<A>()),
+        }
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, A> {
+        enter(&self.cell)
+    }
+}
+
+impl<A: Actor> Clone for ActorRef<A> {
+    /// The clone is held by the same actor as the original, as in simplx.
+    fn clone(&self) -> Self {
+        self.refs.add(self.holder, self.id.index);
+        ActorRef { cell: self.cell.clone(), id: self.id, holder: self.holder, refs: self.refs.clone() }
+    }
+}
+
+impl<A: Actor> Drop for ActorRef<A> {
+    fn drop(&mut self) {
+        self.refs.remove(self.holder, self.id.index);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReferenceError {
+    NotLocal,
+    NotFound,
+    WrongType,
+    Circular,
+}
+
+impl fmt::Display for ReferenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self {
+            ReferenceError::NotLocal => "actor is on another core",
+            ReferenceError::NotFound => "no such actor",
+            ReferenceError::WrongType => "actor has another type",
+            ReferenceError::Circular => "reference would be circular",
+        };
+        f.write_str(what)
+    }
+}
+
+impl std::error::Error for ReferenceError {}
 
 struct HandlerRegistration {
     index: u32,
@@ -210,12 +414,16 @@ pub struct Context {
     effects: bool,
     return_to_sender: bool,
     registrations: Vec<HandlerRegistration>,
-    new_actors: Vec<(ActorId, TypeId, Box<dyn Actor>)>,
+    new_actors: Vec<(ActorId, NewActor, Spawn)>,
     destroy_requests: Vec<ActorId>,
     callbacks: Vec<ActorId>,
 
     free_slots: Vec<(u32, u16)>,
     next_index: u32,
+
+    cells: Vec<Option<(u16, Rc<dyn Any>)>>, // by slot index, to hand out references
+    refs: Rc<Refs>,
+    singletons: HashMap<TypeId, ActorId>,
 }
 
 impl Context {
@@ -231,7 +439,13 @@ impl Context {
 
     #[inline]
     pub fn send<E: Event>(&mut self, dst: ActorId, event: E) {
-        let src = self.current;
+        self.send_from(self.current, dst, event);
+    }
+
+    /// Sends on behalf of `src` (an actor of this core), e.g. from a method called through an
+    /// `ActorRef` while another actor is running.
+    #[inline]
+    pub(crate) fn send_from<E: Event>(&mut self, src: ActorId, dst: ActorId, event: E) {
         let record = self.alloc_record(dst.core, record_len::<E>());
         unsafe { write_record(record, KIND_EVENT, src, dst, event) };
     }
@@ -266,6 +480,51 @@ impl Context {
 
     /// Creates an actor on this core; it is started once the current callback returns.
     pub fn new_actor<A: Actor>(&mut self, actor: A) -> ActorId {
+        self.spawn(new_cell(actor).1, Spawn::default())
+    }
+
+    /// Creates an actor on this core and returns a reference to it; the actor is destroyed once
+    /// the last reference is dropped. Its methods can be called right away; `on_start` runs once
+    /// the current callback returns.
+    pub fn new_referenced_actor<A: Actor>(&mut self, actor: A) -> ActorRef<A> {
+        let (cell, new) = new_cell(actor);
+        let id = self.spawn(new, Spawn { auto_destroy: true, ..Spawn::default() });
+        self.make_ref(cell, id)
+    }
+
+    /// References an existing actor of this core.
+    pub fn reference_local_actor<A: Actor>(&mut self, id: ActorId) -> Result<ActorRef<A>, ReferenceError> {
+        if id.core != self.core {
+            return Err(ReferenceError::NotLocal);
+        }
+        let any = match self.cells.get(id.index as usize) {
+            Some(Some((generation, any))) if *generation == id.generation => any.clone(),
+            _ => return Err(ReferenceError::NotFound),
+        };
+        let cell = any.downcast::<RefCell<A>>().map_err(|_| ReferenceError::WrongType)?;
+        let holder = self.current.index;
+        if holder == id.index || self.refs.table.borrow().reaches(id.index, holder) {
+            return Err(ReferenceError::Circular);
+        }
+        Ok(self.make_ref(cell, id))
+    }
+
+    /// The instance of `A` on this core, created with `make` on first use and destroyed once no
+    /// longer referenced (simplx `newReferencedSingletonActor`).
+    pub fn singleton<A: Actor>(&mut self, make: impl FnOnce() -> A) -> ActorRef<A> {
+        if let Some(&id) = self.singletons.get(&TypeId::of::<A>()) {
+            match self.reference_local_actor(id) {
+                Ok(r) => return r,
+                Err(e) => panic!("cannot reference singleton {}: {e}", type_name::<A>()),
+            }
+        }
+        let (cell, new) = new_cell(make());
+        let id = self.spawn(new, Spawn { auto_destroy: true, singleton: Some(TypeId::of::<A>()), ..Spawn::default() });
+        self.singletons.insert(TypeId::of::<A>(), id);
+        self.make_ref(cell, id)
+    }
+
+    fn spawn(&mut self, new: NewActor, spawn: Spawn) -> ActorId {
         let (index, generation) = self.free_slots.pop().unwrap_or_else(|| {
             self.next_index += 1;
             (self.next_index - 1, 0)
@@ -274,12 +533,28 @@ impl Context {
         let shared = &self.shared.0;
         shared.live_total.fetch_add(1, Ordering::AcqRel);
         shared.live_regular.fetch_add(1, Ordering::AcqRel);
-        self.new_actors.push((id, TypeId::of::<A>(), Box::new(actor)));
+        self.set_cell(id, new.any.clone());
+        self.new_actors.push((id, new, spawn));
         self.effects = true;
         id
     }
 
-    /// `on_destroy_request` of the current actor will be called at the end of this loop iteration.
+    fn set_cell(&mut self, id: ActorId, any: Rc<dyn Any>) {
+        let index = id.index as usize;
+        if self.cells.len() <= index {
+            self.cells.resize_with(index + 1, || None);
+        }
+        self.cells[index] = Some((id.generation, any));
+    }
+
+    fn make_ref<A: Actor>(&mut self, cell: Rc<RefCell<A>>, id: ActorId) -> ActorRef<A> {
+        let holder = self.current.index;
+        self.refs.add(holder, id.index);
+        ActorRef { cell, id, holder, refs: self.refs.clone() }
+    }
+
+    /// `on_destroy_request` of the current actor will be called at the end of this loop iteration,
+    /// or once it is no longer referenced.
     pub fn request_destroy(&mut self) {
         self.destroy_requests.push(self.current);
     }
@@ -370,8 +645,7 @@ impl Context {
 struct StartEntry {
     core: CoreId,
     service: bool,
-    actor_type: TypeId,
-    factory: Box<dyn FnOnce() -> Box<dyn Actor> + Send>,
+    factory: Box<dyn FnOnce() -> NewActor + Send>,
 }
 
 pub struct StartSequence {
@@ -428,12 +702,7 @@ impl StartSequence {
         self.add_core(core);
         let id = ActorId { core: core as u16, generation: 0, index: self.per_core[core] };
         self.per_core[core] += 1;
-        self.entries.push(StartEntry {
-            core,
-            service,
-            actor_type: TypeId::of::<A>(),
-            factory: Box::new(move || Box::new(factory()) as Box<dyn Actor>),
-        });
+        self.entries.push(StartEntry { core, service, factory: Box::new(move || new_cell(factory()).1) });
         id
     }
 }
@@ -526,11 +795,14 @@ impl Drop for Engine {
 // ---- Event loop ------------------------------------------------------------------------------
 
 struct Slot {
-    actor: Option<Box<dyn Actor>>,
-    actor_ptr: *mut u8,
+    cell: Option<Rc<dyn ActorCell>>,
+    actor_ptr: *mut u8, // the RefCell<A> inside `cell`
     actor_type: TypeId,
     generation: u16,
     service: bool,
+    auto_destroy: bool,          // destroy once unreferenced
+    destroy_deferred: bool,      // destroy requested while referenced
+    singleton: Option<TypeId>,
     destroy_pending: bool,
     callback_iteration: u64,
     handlers: Vec<(TypeId, Thunk)>,
@@ -540,11 +812,14 @@ struct Slot {
 impl Slot {
     fn empty() -> Slot {
         Slot {
-            actor: None,
+            cell: None,
             actor_ptr: ptr::null_mut(),
             actor_type: TypeId::of::<()>(),
             generation: 0,
             service: false,
+            auto_destroy: false,
+            destroy_deferred: false,
+            singleton: None,
             destroy_pending: false,
             callback_iteration: u64::MAX,
             handlers: Vec::new(),
@@ -578,22 +853,28 @@ impl Actors {
             return None;
         }
         let slot = self.slots.get(id.index as usize)?;
-        (slot.actor.is_some() && slot.generation == id.generation).then_some(slot)
+        (slot.cell.is_some() && slot.generation == id.generation).then_some(slot)
     }
 
-    fn install(&mut self, ctx: &mut Context, id: ActorId, actor_type: TypeId, service: bool, mut actor: Box<dyn Actor>) {
+    fn install(&mut self, ctx: &mut Context, id: ActorId, new: NewActor, spawn: Spawn) {
         let index = id.index as usize;
         if self.slots.len() <= index {
             self.slots.resize_with(index + 1, Slot::empty);
         }
-        let actor_ptr = &mut *actor as *mut dyn Actor as *mut u8;
-        let slot = &mut self.slots[index];
-        *slot = Slot { actor: Some(actor), actor_ptr, actor_type, generation: id.generation, service, ..Slot::empty() };
+        ctx.set_cell(id, new.any);
+        let cell = new.cell.clone();
+        self.slots[index] = Slot {
+            cell: Some(new.cell),
+            actor_ptr: new.ptr,
+            actor_type: new.actor_type,
+            generation: id.generation,
+            service: spawn.service,
+            auto_destroy: spawn.auto_destroy,
+            singleton: spawn.singleton,
+            ..Slot::empty()
+        };
         ctx.current = id;
-        let actor: *mut dyn Actor = &mut **self.slots[index].actor.as_mut().unwrap();
-        // SAFETY: the box is owned by the slot and stays put while the callback runs (effects that
-        // may grow `slots` are applied after it returns).
-        unsafe { (*actor).on_start(ctx) };
+        cell.on_start(ctx);
         self.apply_effects(ctx);
     }
 
@@ -615,8 +896,8 @@ impl Actors {
             }
         }
         let new_actors = std::mem::take(&mut ctx.new_actors);
-        for (id, actor_type, actor) in new_actors {
-            self.install(ctx, id, actor_type, false, actor);
+        for (id, new, spawn) in new_actors {
+            self.install(ctx, id, new, spawn);
         }
         ctx.current = current;
     }
@@ -658,9 +939,9 @@ impl Actors {
             }
             let slot = &mut self.slots[id.index as usize];
             slot.callback_iteration = iteration;
-            let actor: *mut dyn Actor = &mut **slot.actor.as_mut().unwrap();
+            let cell = slot.cell.clone().unwrap();
             ctx.current = *id;
-            unsafe { (*actor).on_callback(ctx) };
+            cell.on_callback(ctx);
             self.apply_effects(ctx);
         }
         // Keep the allocation for the next iteration.
@@ -676,9 +957,22 @@ impl Actors {
         if shared.shutdown.load(Ordering::Relaxed) {
             let services_too = shared.live_regular.load(Ordering::Acquire) == 0;
             for (index, slot) in self.slots.iter_mut().enumerate() {
-                if slot.actor.is_some() && !slot.destroy_pending && (!slot.service || services_too) {
+                if slot.cell.is_some() && !slot.destroy_pending && (!slot.service || services_too) {
                     slot.destroy_pending = true;
                     ctx.destroy_requests.push(ActorId { core: ctx.core, generation: slot.generation, index: index as u32 });
+                }
+            }
+        }
+        // Actors whose last reference was dropped: destroy them if they asked for it. Tested with
+        // a plain flag: this runs on every loop iteration.
+        if ctx.refs.pending.get() {
+            ctx.refs.pending.set(false);
+            let unreferenced = std::mem::take(&mut ctx.refs.table.borrow_mut().unreferenced);
+            for index in unreferenced {
+                if let Some(slot) = self.slots.get(index as usize) {
+                    if slot.cell.is_some() && (slot.auto_destroy || slot.destroy_deferred) {
+                        ctx.destroy_requests.push(ActorId { core: ctx.core, generation: slot.generation, index });
+                    }
                 }
             }
         }
@@ -692,20 +986,29 @@ impl Actors {
             }
             let index = id.index as usize;
             self.slots[index].destroy_pending = false;
+            if ctx.refs.table.borrow().is_referenced(id.index) {
+                self.slots[index].destroy_deferred = true; // retried once unreferenced
+                continue;
+            }
             ctx.current = id;
-            let actor: *mut dyn Actor = &mut **self.slots[index].actor.as_mut().unwrap();
-            let accepted = unsafe { (*actor).on_destroy_request(ctx) };
+            let cell = self.slots[index].cell.clone().unwrap();
+            let accepted = cell.on_destroy_request(ctx);
             self.apply_effects(ctx);
             if accepted {
-                let slot = &mut self.slots[index];
-                let service = slot.service;
-                let generation = slot.generation;
-                *slot = Slot::empty();
-                ctx.free_slots.push((id.index, generation.wrapping_add(1)));
-                if !service {
+                let slot = std::mem::replace(&mut self.slots[index], Slot::empty());
+                ctx.cells[index] = None;
+                if let Some(t) = slot.singleton {
+                    ctx.singletons.remove(&t);
+                }
+                ctx.free_slots.push((id.index, slot.generation.wrapping_add(1)));
+                if !slot.service {
                     shared.live_regular.fetch_sub(1, Ordering::AcqRel);
                 }
                 shared.live_total.fetch_sub(1, Ordering::AcqRel);
+                // Dropping the actor last: its own references and timers release here, which
+                // may unreference other actors (handled on the next iteration).
+                drop(cell);
+                drop(slot);
             }
         }
     }
@@ -734,14 +1037,17 @@ impl CoreLoop {
             callbacks: Vec::new(),
             free_slots: Vec::new(),
             next_index: entries.len() as u32,
+            cells: Vec::new(),
+            refs: Rc::new(Refs::default()),
+            singletons: HashMap::new(),
         };
         let mut actors = Actors { slots: Vec::new() };
 
         // Start actors are built and started on their own core, as in simplx.
         for (index, entry) in entries.into_iter().enumerate() {
             let id = ActorId { core: core as u16, generation: 0, index: index as u32 };
-            let actor = (entry.factory)();
-            actors.install(&mut ctx, id, entry.actor_type, entry.service, actor);
+            let new = (entry.factory)();
+            actors.install(&mut ctx, id, new, Spawn { service: entry.service, ..Spawn::default() });
         }
         ctx.flush();
         started.wait();

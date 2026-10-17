@@ -13,13 +13,33 @@ simplx (C++) et un équivalent Rust, en se rapprochant progressivement des fonct
 | `registerUndeliveredEventHandler<E>` / `onUndeliveredEvent` | `ctx.register_undelivered_handler::<E, Self>()` / `UndeliveredHandler<E>` |
 | `throw ReturnToSenderException()` | `ctx.return_to_sender()` |
 | `newUnreferencedActor<A>()` | `ctx.new_actor(actor)` |
+| `newReferencedActor<A>()` / `ActorReference<A>` | `ctx.new_referenced_actor(actor)` / `ActorRef<A>` (appel direct : `r.borrow_mut().methode()`) |
+| `referenceLocalActor<A>(id)` (`CircularReferenceException`) | `ctx.reference_local_actor::<A>(id)` (`Err(ReferenceError::Circular)`, etc.) |
+| `newReferencedSingletonActor<A>()` | `ctx.singleton(\|\| actor)` |
+| `TimerActor` (service `service::Timer`) / `TimerProxy` / `onTimeout()` | `TimerService` (service `TimerServiceTag`) / `Timer` / événement `Timeout` |
 | `requestDestroy()` / `onDestroyRequest()` / `acceptDestroy()` | `ctx.request_destroy()` / `on_destroy_request() -> bool` |
 | `registerCallback(*this)` / `onCallback()` | `ctx.register_callback()` / `on_callback()` |
 | `addServiceActor<Tag, A>(core)` / `getServiceActorId<Tag>()` | `add_service::<Tag, _, _>(core, f)` / `ctx.service::<Tag>()` |
 | destructeur de `Engine` (acteurs ordinaires détruits d'abord, services ensuite) | `Engine::shutdown()` / `Drop`, même ordre |
 
-Pas encore couverts : timers, acteurs référencés (`newReferencedActor` et notifications de
-destruction), singletons, `BufferedPipe` et pushs atomiques groupés, connecteurs entre processus.
+Sémantique des références, identique à simplx : un acteur référencé n'est pas détruit tant qu'une
+référence existe (sa demande de destruction est différée). Un acteur créé par
+`new_referenced_actor` ou `singleton` est détruit quand sa dernière référence disparaît. Une
+référence circulaire est refusée. En plus de simplx : `ActorRef` n'est pas `Send`, donc le
+compilateur interdit de la faire sortir de son cœur. Chaque acteur vit dans un `Rc<RefCell<A>>`, si
+bien qu'un appel réentrant (A appelle B qui rappelle A) provoque un panic explicite au lieu
+d'aliaser `&mut A`.
+
+Timers, même architecture que simplx : un `TimerService` sur un cœur garde une échéance par cœur
+client et teste l'horloge par callback tant qu'il en reste une. Un `TimerHub` singleton par cœur
+gère tous les timers du cœur et ne demande au service que la prochaine échéance, si bien qu'un seul
+message traverse les cœurs par tick. Une différence : à l'expiration, le propriétaire reçoit un
+événement `Timeout` (à distinguer avec `timer.is(&t)`, qui ignore aussi un timeout envoyé avant un
+réarmement ou un `unset`) au lieu d'un appel direct à `onTimeout()`. Un appel direct depuis le hub
+laisserait `onTimeout` réarmer un timer pendant que le hub s'exécute, donc aliaser le hub.
+
+Pas encore couverts : `BufferedPipe` et pushs atomiques groupés, `registerPerformanceNeutralCallback`,
+connecteurs entre processus.
 
 ## Contenu
 
@@ -27,14 +47,16 @@ destruction), singletons, `BufferedPipe` et pushs atomiques groupés, connecteur
 |---|---|
 | `src/bytering.rs` | Ring SPSC d'enregistrements de taille variable, alignés sur 16 octets, avec un enregistrement de padding au bouclage pour garder chaque enregistrement contigu. Index `head`/`tail` sur des lignes de cache séparées, copie locale de l'index distant, publication par lots. |
 | `src/engine.rs` | Le moteur : une boucle épinglée en spin actif par cœur, un ring par paire orientée de cœurs. Le handler reçoit `&E` qui pointe directement dans le ring (aucune copie à la livraison). Les événements d'un tour de boucle sont publiés en une fois à la fin du tour. |
+| `src/timer.rs` | `TimerService`, `TimerHub` (singleton par cœur) et `Timer`. |
 | `src/spsc.rs` | Ring SPSC typé, utilisé par le mode `raw` du benchmark. |
 | `src/affinity.rs` | Épinglage via `sched_setaffinity`, sans dépendance. |
 | `tests/engine.rs` | Un test par fonctionnalité : événements hétérogènes en local et entre cœurs, les quatre cas d'événement non délivré, protocole de destruction et callbacks, ordre d'arrêt services/acteurs, débordement d'un ring plein (ordre préservé), aucun événement perdu sans être détruit (y compris ceux en vol à l'arrêt). |
+| `tests/refs_timers.rs` | Appel direct par référence, destruction différée tant qu'un acteur est référencé puis automatique quand il ne l'est plus, erreurs de référence (circulaire, mauvais type, autre cœur), singleton partagé par cœur et distinct entre cœurs, timers (one-shot, répétition, `unset`, jamais en avance), absence de service, arrêt avec timers armés sur plusieurs cœurs. |
 | `src/bin/pingpong_bench.rs` | Benchmark, modes `engine` (Ping et service Pong) et `raw` (deux threads et deux rings, sans moteur : le plancher matériel). |
 | `../bench/pingpong_cpp/` | Le même benchmark avec simplx, modes `spin` (core-actor sans `threadYield()`) et `yield` (`DefaultCoreActor`). |
 | `../bench/run_pingpong.sh` | Compile les deux benchmarks et les exécute en alternance. |
 
-Aucune dépendance externe. `cargo test --release` lance 13 tests.
+Aucune dépendance externe. `cargo test --release` lance 20 tests.
 
 ## Lancer
 
@@ -54,14 +76,22 @@ entrelacées, cœurs 1 et 2, latences en ns :
 
 | impl | min | p50 | p90 | p99 | moyenne | allers-retours/s |
 |---|---:|---:|---:|---:|---:|---:|
-| simplx spin | 883 | 1359 | 1510 | 4858 | 1558 | 508 k |
-| simplx yield | 736 | 1502 | 1752 | 5395 | 1691 | 483 k |
-| **simplx-rs** | 189 | **593** | 788 | 995 | 685 | 1219 k |
-| rust raw (plancher) | 155 | 573 | 714 | 990 | 655 | 1275 k |
+| simplx spin | 783 | 1342 | 1477 | 3977 | 1464 | 549 k |
+| simplx yield | 696 | 1477 | 1698 | 4638 | 1660 | 497 k |
+| **simplx-rs** | 194 | **612** | 782 | 998 | 688 | 1209 k |
+| rust raw (plancher) | 152 | 597 | 771 | 926 | 684 | 1249 k |
 
-Cœurs 0 et 3 (3 exécutions) : simplx spin p50 1357, simplx-rs p50 599, rust raw p50 588.
+(Version avec références, singletons et timers. Avant, sans ces fonctionnalités : simplx-rs p50 593
+contre 573 pour le plancher, cœurs 0 et 3 : simplx spin 1357, simplx-rs 599, raw 588.)
 
-Le moteur Rust ajoute 10 à 20 ns au plancher, simplx environ 780 ns.
+Le moteur Rust ajoute 10 à 20 ns au plancher, simplx environ 750 ns.
+
+À noter pendant l'ajout des références : vider la liste des acteurs déréférencés à chaque tour de
+boucle (emprunt du `RefCell`, `mem::take` du `Vec`) faisait passer le min de 190 à 370 ns et le p50
+d'environ 40 ns, alors que ce sont quelques écritures locales, sans partage de ligne de cache
+(vérifié par les adresses). C'est remplacé par la lecture d'un `Cell<bool>` qui n'est écrit que
+lorsqu'une référence disparaît. Sur un chemin critique de quelques dizaines d'instructions, chaque
+écriture par tour de boucle se voit.
 
 ## D'où venaient les 300 ns du premier PoC
 
