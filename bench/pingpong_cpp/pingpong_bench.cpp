@@ -10,11 +10,13 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include <x86intrin.h>
@@ -27,6 +29,7 @@ static uint64_t g_Iterations = 1000000;
 static uint64_t g_Warmup = 100000;
 static std::vector<uint64_t> g_Samples; // round-trip times in TSC ticks
 static uint64_t g_TotalTicks = 0;       // wall time of the measured phase, in TSC ticks
+static std::atomic<bool> g_Done(false); // set by PingActor; the engine is only destroyed afterwards
 
 struct PingEvent : Actor::Event
 {
@@ -72,18 +75,10 @@ class PingActor : public Actor
         if (++m_Count == g_Warmup + g_Iterations)
         {
             g_TotalTicks = now - m_Start;
-            requestDestroy();
+            g_Done.store(true, std::memory_order_release);
             return;
         }
         m_Pipe.push<PingEvent>(m_Count, __rdtsc());
-    }
-
-    void onDestroyRequest() noexcept override
-    {
-        if (m_Count == g_Warmup + g_Iterations)
-            acceptDestroy();
-        else
-            requestDestroy();
     }
 
   private:
@@ -125,7 +120,11 @@ int main(int argc, char **argv)
     const auto wall0 = std::chrono::steady_clock::now();
     const uint64_t tsc0 = __rdtsc();
     {
-        Engine engine(startSequence); // returns once PingActor accepted destruction
+        Engine engine(startSequence);
+        // Destroying the engine early would put every actor in destroy-requested mode for the whole
+        // run (onDestroyRequest called on each loop iteration), so wait for Ping to finish first.
+        while (!g_Done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const uint64_t tsc1 = __rdtsc();
     const auto wall1 = std::chrono::steady_clock::now();
