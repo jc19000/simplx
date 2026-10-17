@@ -1,5 +1,8 @@
 # simplx-rs : PoC d'un moteur d'acteurs façon simplx en Rust
 
+> **Ce PoC est devenu la crate [`cannes`](https://github.com/jc19000/cannes)** (dépôt dédié, README en
+> anglais, CI, publication crates.io). Cette branche reste l'historique de l'expérimentation.
+
 Objectif : comparer la latence aller-retour inter-cœurs (ping-pong, un seul événement en vol) entre
 simplx (C++) et un équivalent Rust, en se rapprochant progressivement des fonctionnalités de simplx.
 
